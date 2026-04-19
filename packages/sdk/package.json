@@ -1,5 +1,5 @@
 {
-  "name": "@deltapilot/adapters",
+  "name": "@deltapilot/sdk",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -14,14 +14,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@deltapilot/core": "workspace:*",
     "@deltapilot/shared": "workspace:*",
-    "execa": "^9.5.2"
+    "@modelcontextprotocol/sdk": "^1.13.0"
   },
   "devDependencies": {
+    "@deltapilot/core": "workspace:*",
     "@deltapilot/mcp-server": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.13.0",
     "@types/node": "^22.10.5",
+    "execa": "^9.5.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
   }
