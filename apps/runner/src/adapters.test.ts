@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { MockAdapter } from "./adapters/mock.js";
-import { getAdapter, registerAdapter } from "./adapters.js";
+import { getAdapter, registerAdapter, resetAdapters } from "./adapters.js";
+
+beforeEach(() => {
+  resetAdapters();
+});
 
 describe("adapter registry", () => {
   it("returns registered adapter by kind", () => {
