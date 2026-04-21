@@ -15,6 +15,7 @@ export const TERMINAL_STATUSES: ReadonlyArray<TaskStatus> = ["done", "cancelled"
 
 export const agentKindSchema = z.enum([
   "claude-code",
+  "claude-sdk",
   "codex",
   "opendevin",
   "hermes",

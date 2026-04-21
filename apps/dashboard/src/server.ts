@@ -501,6 +501,7 @@ async function createTaskFromBody(
 
 const VALID_AGENT_KINDS: Agent["kind"][] = [
   "claude-code",
+  "claude-sdk",
   "codex",
   "opendevin",
   "hermes",
