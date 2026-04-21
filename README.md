@@ -11,16 +11,35 @@ DeltaPilot coordinates terminal-capable AI coding agents (Claude Code, Codex, Op
 ```bash
 pnpm install
 pnpm test
+pnpm demo
+```
+
+To inspect a live repo with the dashboard:
+
+```bash
+pnpm dashboard -- --repo /abs/path/to/target/repo --host 0.0.0.0 --port 3000
+```
+
+For Docker-based deployment:
+
+```bash
+pnpm docker:build
 ```
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) once it lands. Core constraints:
+Core constraints:
 
 - **Handoff is artifact-based**, not conversation-based. Agents share files (task brief, git diff, scratchpad, next-steps), not LLM memory.
 - **Each task runs in its own git worktree** under `.deltapilot/workspaces/<task_id>/`.
 - **Atomic task claim** via SQLite `UPDATE ... RETURNING` inside `BEGIN IMMEDIATE`.
 - **Transport is not the data model** — `AgentAdapter` interface with MCP and HTTP implementations.
+
+## Ops
+
+- Dashboard guide: [`docs/dashboard.md`](docs/dashboard.md)
+- Docker guide: [`docs/docker.md`](docs/docker.md)
+- Agent integration / MCP wiring: [`docs/agent-integration.md`](docs/agent-integration.md)
 
 ## License
 
