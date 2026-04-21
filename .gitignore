@@ -12,6 +12,7 @@ coverage/
 
 .claude/
 .deltapilot/
+docs/superpowers/
 
 # SQLite runtime data
 *.db

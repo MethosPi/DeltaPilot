@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeltaPilot Dashboard</title>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">DeltaPilot</p>
+          <h1>Agent Handoff Dashboard</h1>
+        </div>
+        <div class="hero-actions">
+          <div class="poll-indicator">
+            <span class="dot"></span>
+            <span>5s</span>
+          </div>
+          <button id="refreshButton" class="secondary-button" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="stats-strip" id="statsStrip"></section>
+
+      <main class="layout">
+        <aside class="sidebar">
+          <section class="panel create-panel">
+            <div class="panel-header">
+              <p class="panel-kicker">Create Task</p>
+              <h2>Create in To Do</h2>
+            </div>
+            <form id="createTaskForm" class="task-form">
+              <label>
+                <span>Title</span>
+                <input name="title" type="text" required />
+              </label>
+              <label>
+                <span>Brief</span>
+                <textarea name="brief" rows="4"></textarea>
+              </label>
+              <label>
+                <span>Priority (0-100)</span>
+                <input name="priority" type="number" min="0" max="100" value="50" />
+              </label>
+              <label>
+                <span>Acceptance Goal</span>
+                <input name="goal" type="text" placeholder="Optional" />
+              </label>
+              <label>
+                <span>Deliverables</span>
+                <textarea name="deliverables" rows="3" placeholder="One per line"></textarea>
+              </label>
+              <label>
+                <span>Files In Scope</span>
+                <textarea name="files_in_scope" rows="3" placeholder="One per line"></textarea>
+              </label>
+              <label>
+                <span>Success Test</span>
+                <input name="success_test" type="text" placeholder="Optional" />
+              </label>
+              <button class="primary-button" type="submit">Create Task</button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <p class="panel-kicker">Register Agent</p>
+              <h2>Add worker</h2>
+            </div>
+            <form id="registerAgentForm" class="task-form">
+              <label>
+                <span>Name</span>
+                <input name="name" type="text" required placeholder="e.g. claude-code-1" />
+              </label>
+              <label>
+                <span>Kind</span>
+                <select name="kind" required>
+                  <option value="claude-code">claude-code</option>
+                  <option value="codex">codex</option>
+                  <option value="opendevin">opendevin</option>
+                  <option value="hermes">hermes</option>
+                  <option value="mock">mock</option>
+                  <option value="other">other</option>
+                </select>
+              </label>
+              <button class="primary-button" type="submit">Register</button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <p class="panel-kicker">Agents</p>
+              <h2>Registered workers</h2>
+            </div>
+            <div id="agentsList" class="agent-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <p class="panel-kicker">Recent Handoffs</p>
+              <h2>Last requeues</h2>
+            </div>
+            <div id="handoffList" class="handoff-list"></div>
+          </section>
+        </aside>
+
+        <section class="board-panel panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Board</p>
+            </div>
+            <div class="meta-badges">
+              <span id="repoMeta" class="meta-badge"></span>
+              <span id="dbMeta" class="meta-badge"></span>
+            </div>
+          </div>
+          <div id="board" class="board"></div>
+        </section>
+
+        <aside class="detail-panel panel">
+          <div id="taskDetail" class="task-detail empty-state">
+            <p class="panel-kicker">Task Detail</p>
+            <h2>Select a task</h2>
+            <p>Pick any card in the board to inspect events, handoffs, artifacts, and available actions.</p>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+  </html>

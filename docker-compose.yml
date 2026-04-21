@@ -1,0 +1,42 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deltapilot:local
+    command:
+      - dashboard
+      - --repo
+      - /workspace/repo
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3000"
+    ports:
+      - "3000:3000"
+    environment:
+      DP_DASHBOARD_USERNAME: admin
+      DP_DASHBOARD_PASSWORD: change-me
+    volumes:
+      - ./docker-data/repo:/workspace/repo
+    restart: unless-stopped
+
+  # MCP is a stdio process, not an HTTP service. Use this profile only if you
+  # want to run it interactively from Docker.
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deltapilot:local
+    command:
+      - mcp
+      - --repo
+      - /workspace/repo
+      - --agent-id
+      - REPLACE_WITH_AGENT_UUID
+    profiles:
+      - mcp
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./docker-data/repo:/workspace/repo

@@ -1,0 +1,13 @@
+.git
+.gitignore
+.turbo
+.claude
+.deltapilot
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+**/coverage
+.DS_Store
+*.log

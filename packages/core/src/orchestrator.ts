@@ -265,38 +265,56 @@ export class Orchestrator {
     this.getAgent(agentId); // throws if unknown
     const ts = this.now().toISOString();
 
-    // Single atomic statement: UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING
-    const row = this.raw
-      .prepare(
-        `
-        UPDATE tasks
-           SET status = 'in_progress',
-               assigned_agent_id = @agent,
-               claimed_at = @ts,
-               last_heartbeat_at = @ts,
-               updated_at = @ts
-         WHERE id = (
-           SELECT id FROM tasks
-            WHERE status IN ('todo', 'handoff_pending')
-              AND assigned_agent_id IS NULL
-            ORDER BY
-              CASE status WHEN 'handoff_pending' THEN 0 ELSE 1 END,
-              priority DESC,
-              created_at ASC
-            LIMIT 1
-         )
-         RETURNING *
-        `,
-      )
-      .get({ agent: agentId, ts }) as TaskRow | undefined;
+    const row = this.raw.transaction(() => {
+      const candidate = this.raw
+        .prepare(
+          `
+          SELECT id, status, branch_name
+          FROM tasks
+          WHERE status IN ('todo', 'handoff_pending')
+            AND assigned_agent_id IS NULL
+          ORDER BY
+            CASE status WHEN 'handoff_pending' THEN 0 ELSE 1 END,
+            priority DESC,
+            created_at ASC
+          LIMIT 1
+          `,
+        )
+        .get() as { id: string; status: string; branch_name: string | null } | undefined;
+
+      if (!candidate) return null;
+
+      const info = this.raw
+        .prepare(
+          `
+          UPDATE tasks
+             SET status = 'in_progress',
+                 assigned_agent_id = ?,
+                 claimed_at = ?,
+                 last_heartbeat_at = ?,
+                 updated_at = ?
+           WHERE id = ?
+             AND status = ?
+             AND assigned_agent_id IS NULL
+          `,
+        )
+        .run(agentId, ts, ts, ts, candidate.id, candidate.status);
+
+      if (info.changes === 0) {
+        return null;
+      }
+
+      return {
+        id: candidate.id,
+        previous_status: taskStatusSchema.parse(candidate.status),
+        previous_branch_name: candidate.branch_name,
+      };
+    })();
 
     if (!row) return null;
 
-    // The UPDATE didn't touch branch_name, so the returned row still carries its prior
-    // value — null for a task that was claimed for the first time, set for a task that
-    // was previously in flight and is now being resumed after a handoff.
-    const isResume = row.branch_name !== null;
-    const fromStatus: TaskStatus = isResume ? "handoff_pending" : "todo";
+    const fromStatus = row.previous_status;
+    const isResume = row.previous_branch_name !== null;
 
     const { branchName, worktreePath } = isResume
       ? await this.worktreeMgr.attachWorktree(row.id)

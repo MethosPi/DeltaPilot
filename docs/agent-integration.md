@@ -23,9 +23,22 @@ pnpm install
 pnpm -r build
 ```
 
+For a one-command local smoke test that seeds a disposable demo repo and runs
+`claim_task -> commit -> submit_work`, run:
+
+```bash
+pnpm demo
+```
+
 This produces `packages/mcp-server/dist/cli.js`, which is the actual MCP
 server. It is invoked as `node packages/mcp-server/dist/cli.js ...` or, after
 publishing, as the `deltapilot-mcp` bin.
+
+If you also want the board UI against the same repo and DB, run:
+
+```bash
+pnpm dashboard -- --repo /abs/path/to/your/target/repo --host 0.0.0.0 --port 3000
+```
 
 Every agent is **spawn-bound to one `agent_id`** via CLI flag or env:
 

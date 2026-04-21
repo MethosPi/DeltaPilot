@@ -1,0 +1,35 @@
+{
+  "name": "@deltapilot/dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "deltapilot-dashboard": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "public"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ./scripts/bundle-cli.mjs && node ./scripts/copy-public.mjs && chmod +x dist/cli.js",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@deltapilot/core": "workspace:*",
+    "@deltapilot/shared": "workspace:*",
+    "better-sqlite3": "^11.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
