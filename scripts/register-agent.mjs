@@ -3,7 +3,7 @@
 // Usage:
 //   node scripts/register-agent.mjs --name <name> --kind <kind> [--repo <path>] [--transport <t>]
 //
-// kind: claude-code | codex | opendevin | hermes | mock | other
+// kind: claude-code | claude-sdk | codex | opendevin | hermes | mock | other
 // transport (default mcp-stdio): mcp-stdio | http
 //
 // Prints the generated agent UUID to stdout, one "KEY=VALUE" line per field.
@@ -34,7 +34,7 @@ if (!values.name || !values.kind) {
   process.exit(2);
 }
 
-const VALID_KINDS = ["claude-code", "codex", "opendevin", "hermes", "mock", "other"];
+const VALID_KINDS = ["claude-code", "claude-sdk", "codex", "opendevin", "hermes", "mock", "other"];
 const VALID_TRANSPORTS = ["mcp-stdio", "http"];
 
 if (!VALID_KINDS.includes(values.kind)) {
