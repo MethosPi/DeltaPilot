@@ -12,3 +12,8 @@ coverage/
 
 .claude/
 .deltapilot/
+
+# SQLite runtime data
+*.db
+*.db-shm
+*.db-wal
