@@ -152,11 +152,17 @@ function buildCommand(ctx: AdapterContext, outputPath: string, schemaPath: strin
   return `${base} ${args.join(" ")}`;
 }
 
-async function buildPrompt(ctx: AdapterContext): Promise<string> {
+export async function buildPrompt(ctx: AdapterContext): Promise<string> {
   const acceptance = formatAcceptance(ctx.task.acceptance);
   const plan = ctx.orchestrator
     ? await ctx.orchestrator.readArtifact(ctx.task.id, "execution_plan")
     : null;
+  const checkpoint = ctx.orchestrator
+    ? await ctx.orchestrator.readArtifact(ctx.task.id, "checkpoint")
+    : null;
+  const budget = ctx.task.budget
+    ? `Budget:\n${JSON.stringify(ctx.task.budget, null, 2)}`
+    : "";
 
   const common = [
     `Task ID: ${ctx.task.id}`,
@@ -165,7 +171,9 @@ async function buildPrompt(ctx: AdapterContext): Promise<string> {
     `Current status: ${ctx.task.status}`,
     `Worktree path: ${ctx.worktreePath}`,
     acceptance,
+    budget,
     plan?.trim() ? `Execution plan:\n${plan.trim()}` : "",
+    checkpoint?.trim() ? `Latest checkpoint:\n${checkpoint.trim()}` : "",
   ].filter(Boolean).join("\n\n");
 
   switch (ctx.agentRole) {
@@ -190,8 +198,8 @@ async function buildPrompt(ctx: AdapterContext): Promise<string> {
         "You are the DeltaPipeline reviewer agent.",
         "Inspect the worktree, compare it against the task acceptance criteria, and decide whether the task is complete.",
         "Return JSON matching the provided schema with:",
-        '- `decision`: "approve" if complete, otherwise "bounce"',
-        "- `note`: a concise justification. If bouncing, include concrete missing work.",
+        '- `decision`: "approve" if the task is ready for human review via pull request, otherwise "bounce"',
+        "- `note`: a concise justification. If bouncing, include concrete missing work. If approving, summarize what the human should verify.",
         "Be strict: bounce if acceptance is not clearly met.",
         common,
       ].join("\n\n");
@@ -219,9 +227,10 @@ function formatAcceptance(acceptance: AdapterContext["task"]["acceptance"]): str
   return parts.length > 0 ? parts.join("\n") : "Acceptance criteria: none provided.";
 }
 
-function classifyFailure(message: string): AdapterResult["kind"] {
+export function classifyFailure(message: string): AdapterResult["kind"] {
   if (/rate.?limit/i.test(message)) return "rate_limit";
   if (/context length|context window|too much context/i.test(message)) return "context_limit";
+  if (/budget exceeded|spend limit|cost limit/i.test(message)) return "budget_exceeded";
   return "error";
 }
 

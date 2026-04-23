@@ -1,11 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { Orchestrator, WorktreeManager, openDatabase } from "@deltapilot/core";
+import {
+  Orchestrator,
+  WorktreeManager,
+  openDatabase,
+  type GitHubHelper,
+} from "@deltapilot/core";
 import { MockAdapter } from "./adapters/mock.js";
 import { registerAdapter, resetAdapters } from "./adapters.js";
 import { Runner } from "./runner.js";
@@ -37,6 +42,39 @@ function makeOrchestrator(repoRoot: string, dbPath: string): { conn: ReturnType<
   return { conn, orch };
 }
 
+function createMockGitHubHelper(): GitHubHelper {
+  return {
+    ensurePullRequest: vi.fn(async ({ branchName, baseBranch }) => ({
+      provider: "github",
+      base_branch: baseBranch ?? "main",
+      head_branch: branchName,
+      head_sha: "pr-head-sha",
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+      review_decision: "APPROVED",
+      merged_sha: null,
+      last_synced_at: new Date().toISOString(),
+      last_error: null,
+    })),
+    readPullRequest: vi.fn(async ({ branchName, baseBranch }) => ({
+      provider: "github",
+      base_branch: baseBranch ?? "main",
+      head_branch: branchName,
+      head_sha: "pr-head-sha",
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+      review_decision: "APPROVED",
+      merged_sha: null,
+      last_synced_at: new Date().toISOString(),
+      last_error: null,
+    })),
+    diffStat: vi.fn(async () => " greeting.txt | 1 +"),
+    rebaseBranch: vi.fn(async () => ({ headSha: "rebased-head-sha" })),
+    mergePullRequest: vi.fn(async () => ({ mergedSha: "merged-main-sha" })),
+    buildHumanReviewPacket: vi.fn(() => "# Human Review Packet\n\nPR: https://github.com/example/repo/pull/42"),
+  };
+}
+
 async function settleRunner(runner: Runner, ticks = 20): Promise<void> {
   for (let i = 0; i < ticks; i += 1) {
     await runner.runOnce();
@@ -64,6 +102,7 @@ describe("Runner", () => {
     let plannerId = "";
     let executorId = "";
     let reviewerId = "";
+    let mergerId = "";
     let taskId = "";
     try {
       plannerId = (
@@ -89,6 +128,15 @@ describe("Runner", () => {
           name: "reviewer-1",
           kind: "mock",
           role: "reviewer",
+          runtimeMode: "managed",
+          transport: "mcp-stdio",
+        })
+      ).id;
+      mergerId = (
+        await orch.registerAgent({
+          name: "merger-1",
+          kind: "mock",
+          role: "merger",
           runtimeMode: "managed",
           transport: "mcp-stdio",
         })
@@ -127,17 +175,22 @@ describe("Runner", () => {
         }),
     );
 
-    const runner = new Runner({ repoRoot, dbPath, pollIntervalMs: 250 });
+    const githubHelper = createMockGitHubHelper();
+    const runner = new Runner({ repoRoot, dbPath, pollIntervalMs: 250, githubHelper });
     try {
-      await settleRunner(runner, 16);
+      await settleRunner(runner, 20);
       const finalTask = runner.orch.getTask(taskId);
       expect(finalTask.status).toBe("done");
+      expect(finalTask.pull_request?.number).toBe(42);
+      expect(finalTask.pull_request?.merged_sha).toBe("merged-main-sha");
 
       const plan = await runner.orch.readArtifact(taskId, "execution_plan");
       expect(plan).toContain("create greeting.txt");
+      const packet = await runner.orch.readArtifact(taskId, "human_review_packet");
+      expect(packet).toContain("Human Review Packet");
 
       const sessions = runner.orch.listAgentSessions({ managedOnly: true });
-      expect(sessions).toHaveLength(3);
+      expect(sessions).toHaveLength(4);
       for (const session of sessions) {
         expect(existsSync(session.log_path)).toBe(true);
         const content = await readFile(session.log_path, "utf8");
@@ -147,6 +200,7 @@ describe("Runner", () => {
       expect(runner.orch.getAgent(plannerId).last_seen_at).toBeTruthy();
       expect(runner.orch.getAgent(executorId).last_seen_at).toBeTruthy();
       expect(runner.orch.getAgent(reviewerId).last_seen_at).toBeTruthy();
+      expect(runner.orch.getAgent(mergerId).last_seen_at).toBeTruthy();
     } finally {
       await runner.stop();
     }
@@ -192,6 +246,13 @@ describe("Runner", () => {
         runtimeMode: "managed",
         transport: "mcp-stdio",
       });
+      await orch.registerAgent({
+        name: "merger-1",
+        kind: "mock",
+        role: "merger",
+        runtimeMode: "managed",
+        transport: "mcp-stdio",
+      });
       taskId = (await orch.createTask({ title: "Fallback task" })).id;
       orch.setAgentCooldown(executorBId, new Date(Date.now() + 60_000).toISOString(), null);
     } finally {
@@ -224,13 +285,15 @@ describe("Runner", () => {
         }),
     );
 
-    const runner = new Runner({ repoRoot, dbPath, pollIntervalMs: 250 });
+    const githubHelper = createMockGitHubHelper();
+    const runner = new Runner({ repoRoot, dbPath, pollIntervalMs: 250, githubHelper });
     try {
       await settleRunner(runner, 8);
       runner.orch.setAgentCooldown(executorBId, null, null);
-      await settleRunner(runner, 16);
+      await settleRunner(runner, 20);
       const finalTask = runner.orch.getTask(taskId);
       expect(finalTask.status).toBe("done");
+      expect(finalTask.pull_request?.number).toBe(42);
       expect(attempts.get("executor-a")).toBe(1);
       expect(attempts.get("executor-b")).toBeGreaterThanOrEqual(1);
 

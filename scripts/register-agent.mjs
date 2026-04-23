@@ -5,7 +5,7 @@
 //   node scripts/register-agent.mjs --name <name> --kind <kind> [--role <role>] [--repo <path>] [--transport <t>] [--runtime-mode <mode>] [--db <path>]
 //
 // kind: claude-code | claude-sdk | openclaw | codex | opendevin | hermes | mock | other
-// role: planner | executor | reviewer
+// role: planner | executor | reviewer | merger
 // runtime-mode (default external): managed | external
 // transport (default mcp-stdio): mcp-stdio | http
 //
@@ -26,7 +26,7 @@ const USAGE = [
   "  node scripts/register-agent.mjs --name <name> --kind <kind> [--role <role>] [--repo <path>] [--transport <t>] [--runtime-mode <mode>] [--db <path>]",
 ].join("\n");
 const VALID_KINDS = ["claude-code", "claude-sdk", "openclaw", "codex", "opendevin", "hermes", "mock", "other"];
-const VALID_ROLES = ["planner", "executor", "reviewer"];
+const VALID_ROLES = ["planner", "executor", "reviewer", "merger"];
 const VALID_RUNTIME_MODES = ["managed", "external"];
 const VALID_TRANSPORTS = ["mcp-stdio", "http"];
 

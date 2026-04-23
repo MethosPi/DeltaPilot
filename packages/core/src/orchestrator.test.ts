@@ -159,6 +159,192 @@ describe("Orchestrator", () => {
     expect(reset.status_note).toBe("human reset");
   });
 
+  it("approves review into PR-backed human_review and preserves the worktree", async () => {
+    const planner = await orch.registerAgent({
+      name: "planner",
+      kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const executor = await orch.registerAgent({
+      name: "executor",
+      kind: "mock",
+      role: "executor",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const reviewer = await orch.registerAgent({
+      name: "reviewer",
+      kind: "mock",
+      role: "reviewer",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+
+    const task = await orch.createTask({
+      title: "PR review",
+      acceptance: {
+        goal: "Ship x.txt",
+        deliverables: ["x.txt"],
+        files_in_scope: ["x.txt"],
+        success_test: "cat x.txt",
+      },
+    });
+
+    await orch.claimNextTask(planner.id);
+    await orch.publishPlan(task.id, planner.id, "Plan");
+    const execution = await orch.claimNextTask(executor.id);
+    await writeFile(path.join(execution!.worktree_path!, "x.txt"), "done\n", "utf8");
+    await execa("git", ["add", "."], { cwd: execution!.worktree_path! });
+    await execa("git", ["commit", "-m", "exec"], { cwd: execution!.worktree_path! });
+    await orch.submitWork(task.id, executor.id);
+    const review = await orch.claimNextTask(reviewer.id);
+    expect(review?.status).toBe("review");
+
+    await orch.writeArtifact(task.id, "human_review_packet", "# packet", reviewer.id);
+    await orch.approveForHumanReview(task.id, {
+      note: "Ready for PR approval",
+      reason: "approval",
+      preserveWorktree: true,
+      pullRequest: {
+        provider: "github",
+        baseBranch: "main",
+        headBranch: review!.branch_name!,
+        headSha: "head-sha",
+        number: 42,
+        url: "https://github.com/example/repo/pull/42",
+        reviewDecision: "APPROVED",
+        lastSyncedAt: new Date().toISOString(),
+        lastError: null,
+      },
+    }, reviewer.id);
+
+    const humanReview = orch.getTask(task.id);
+    expect(humanReview.status).toBe("human_review");
+    expect(humanReview.human_review_reason).toBe("approval");
+    expect(humanReview.pull_request?.number).toBe(42);
+    expect(humanReview.worktree_path).toBeTruthy();
+    expect(existsSync(humanReview.worktree_path!)).toBe(true);
+
+    const reviewReport = await orch.readArtifact(task.id, "review_report");
+    expect(reviewReport).toContain("Ready for PR approval");
+    const packet = await orch.readArtifact(task.id, "human_review_packet");
+    expect(packet).toContain("packet");
+  });
+
+  it("queues merge, completes a merge, and sends blocked merges back to human_review", async () => {
+    const planner = await orch.registerAgent({
+      name: "planner",
+      kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const executor = await orch.registerAgent({
+      name: "executor",
+      kind: "mock",
+      role: "executor",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const reviewer = await orch.registerAgent({
+      name: "reviewer",
+      kind: "mock",
+      role: "reviewer",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const merger = await orch.registerAgent({
+      name: "merger",
+      kind: "mock",
+      role: "merger",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+
+    const task = await orch.createTask({ title: "merge me" });
+    await orch.claimNextTask(planner.id);
+    await orch.publishPlan(task.id, planner.id, "Plan");
+    const execution = await orch.claimNextTask(executor.id);
+    await writeFile(path.join(execution!.worktree_path!, "merge.txt"), "ready\n", "utf8");
+    await execa("git", ["add", "."], { cwd: execution!.worktree_path! });
+    await execa("git", ["commit", "-m", "exec"], { cwd: execution!.worktree_path! });
+    await orch.submitWork(task.id, executor.id);
+    const review = await orch.claimNextTask(reviewer.id);
+    await orch.approveForHumanReview(task.id, {
+      note: "Ready",
+      reason: "approval",
+      preserveWorktree: true,
+      pullRequest: {
+        provider: "github",
+        baseBranch: "main",
+        headBranch: review!.branch_name!,
+        headSha: "head-sha",
+        number: 99,
+        url: "https://github.com/example/repo/pull/99",
+        reviewDecision: "APPROVED",
+        lastSyncedAt: new Date().toISOString(),
+        lastError: null,
+      },
+    }, reviewer.id);
+
+    const queued = orch.queueMerge(task.id);
+    expect(queued.status).toBe("merging");
+
+    const mergeClaim = await orch.claimNextTask(merger.id);
+    expect(mergeClaim?.status).toBe("merging");
+    const merged = await orch.submitMergeResult(task.id, merger.id, {
+      result: "merged",
+      mergedSha: "merged-sha",
+      pullRequest: {
+        mergedSha: "merged-sha",
+        reviewDecision: "APPROVED",
+        lastSyncedAt: new Date().toISOString(),
+      },
+    });
+    expect(merged.status).toBe("done");
+    expect(merged.pull_request?.merged_sha).toBe("merged-sha");
+
+    const retryTask = await orch.createTask({ title: "merge conflict" });
+    await orch.claimNextTask(planner.id);
+    await orch.publishPlan(retryTask.id, planner.id, "Plan");
+    const retryExecution = await orch.claimNextTask(executor.id);
+    await writeFile(path.join(retryExecution!.worktree_path!, "conflict.txt"), "ready\n", "utf8");
+    await execa("git", ["add", "."], { cwd: retryExecution!.worktree_path! });
+    await execa("git", ["commit", "-m", "exec"], { cwd: retryExecution!.worktree_path! });
+    await orch.submitWork(retryTask.id, executor.id);
+    const retryReview = await orch.claimNextTask(reviewer.id);
+    await orch.approveForHumanReview(retryTask.id, {
+      note: "Ready",
+      reason: "approval",
+      preserveWorktree: true,
+      pullRequest: {
+        provider: "github",
+        baseBranch: "main",
+        headBranch: retryReview!.branch_name!,
+        headSha: "head-sha",
+        number: 100,
+        url: "https://github.com/example/repo/pull/100",
+        reviewDecision: "APPROVED",
+        lastSyncedAt: new Date().toISOString(),
+        lastError: null,
+      },
+    }, reviewer.id);
+    orch.queueMerge(retryTask.id);
+    await orch.claimNextTask(merger.id);
+    const blocked = await orch.submitMergeResult(retryTask.id, merger.id, {
+      result: "blocked",
+      reason: "merge_conflict",
+      note: "Rebase conflict on README.md",
+      preserveWorktree: true,
+    });
+    expect(blocked.status).toBe("human_review");
+    expect(blocked.human_review_reason).toBe("merge_conflict");
+    const mergeReport = await orch.readArtifact(retryTask.id, "merge_report");
+    expect(mergeReport).toContain("Rebase conflict");
+  });
+
   it("deletes an inactive agent and keeps task history intact", async () => {
     const planner = await orch.registerAgent({
       name: "planner",

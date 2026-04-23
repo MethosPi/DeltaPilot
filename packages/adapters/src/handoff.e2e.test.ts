@@ -46,7 +46,7 @@ describe("handoff e2e — autonomous pipeline", () => {
   });
 
   it(
-    "executor A hits a rate limit mid-task -> executor B resumes -> reviewer approves -> task reaches Done on the same branch",
+    "executor A hits a rate limit mid-task -> executor B resumes -> reviewer sends to human review -> merger finishes on the same branch",
     async () => {
       const planner = await orch.registerAgent({
         name: "planner",
@@ -66,6 +66,20 @@ describe("handoff e2e — autonomous pipeline", () => {
         name: "executor-b",
         kind: "mock",
         role: "executor",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const reviewer = await orch.registerAgent({
+        name: "reviewer",
+        kind: "mock",
+        role: "reviewer",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const merger = await orch.registerAgent({
+        name: "merger",
+        kind: "mock",
+        role: "merger",
         runtimeMode: "external",
         transport: "mcp-stdio",
       });
@@ -141,8 +155,51 @@ describe("handoff e2e — autonomous pipeline", () => {
 
       expect(orch.getTask(created.id).status).toBe("review");
 
-      await orch.reviewDecision(created.id, { decision: "approve", note: "Looks good" });
-      expect(orch.getTask(created.id).status).toBe("done");
+      const review = await orch.claimNextTask(reviewer.id);
+      expect(review?.status).toBe("review");
+
+      await orch.approveForHumanReview(created.id, {
+        note: "Looks good",
+        reason: "approval",
+        preserveWorktree: true,
+        pullRequest: {
+          provider: "github",
+          baseBranch: "main",
+          headBranch: review!.branch_name!,
+          headSha: "head-sha",
+          number: 7,
+          url: "https://github.com/example/repo/pull/7",
+          reviewDecision: "APPROVED",
+          lastSyncedAt: new Date().toISOString(),
+          lastError: null,
+        },
+      }, reviewer.id);
+
+      const humanReview = orch.getTask(created.id);
+      expect(humanReview.status).toBe("human_review");
+      expect(humanReview.human_review_reason).toBe("approval");
+      expect(humanReview.pull_request?.number).toBe(7);
+      expect(humanReview.branch_name).toBe(claimedByA!.branch_name);
+
+      const queued = orch.queueMerge(created.id);
+      expect(queued.status).toBe("merging");
+
+      const mergeClaim = await orch.claimNextTask(merger.id);
+      expect(mergeClaim?.status).toBe("merging");
+      expect(mergeClaim?.branch_name).toBe(claimedByA!.branch_name);
+
+      const merged = await orch.submitMergeResult(created.id, merger.id, {
+        result: "merged",
+        note: "Merged to main",
+        mergedSha: "merged-main-sha",
+        pullRequest: {
+          reviewDecision: "APPROVED",
+          mergedSha: "merged-main-sha",
+          lastSyncedAt: new Date().toISOString(),
+        },
+      });
+      expect(merged.status).toBe("done");
+      expect(merged.pull_request?.merged_sha).toBe("merged-main-sha");
 
       const branch = claimedByA!.branch_name!;
       const { stdout: log } = await execa("git", ["log", "--format=%s", branch], { cwd: repoRoot });
@@ -151,6 +208,7 @@ describe("handoff e2e — autonomous pipeline", () => {
         "seed",
         "wip: start greeting",
         "wip: more letters",
+        "deltapilot: wip snapshot before handoff (rate_limit)",
         "finish greeting",
       ]);
 

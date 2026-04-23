@@ -6,6 +6,7 @@ export const taskStatusSchema = z.enum([
   "in_progress",
   "review",
   "human_review",
+  "merging",
   "done",
   "cancelled",
 ]);
@@ -67,6 +68,7 @@ export const agentKindSchema = z.enum([
   "claude-sdk",
   "openclaw",
   "codex",
+  "ollama",
   "opendevin",
   "hermes",
   "mock",
@@ -74,7 +76,33 @@ export const agentKindSchema = z.enum([
 ]);
 export type AgentKind = z.infer<typeof agentKindSchema>;
 
-export const agentRoleSchema = z.enum(["planner", "executor", "reviewer"]);
+export const agentProviderFamilySchema = z.enum([
+  "openai",
+  "anthropic",
+  "openclaw",
+  "ollama",
+  "generic",
+]);
+export type AgentProviderFamily = z.infer<typeof agentProviderFamilySchema>;
+
+export const agentCostTierSchema = z.enum([
+  "local",
+  "low",
+  "medium",
+  "high",
+  "premium",
+]);
+export type AgentCostTier = z.infer<typeof agentCostTierSchema>;
+
+export const agentHealthStateSchema = z.enum([
+  "healthy",
+  "cooldown",
+  "degraded",
+  "offline",
+]);
+export type AgentHealthState = z.infer<typeof agentHealthStateSchema>;
+
+export const agentRoleSchema = z.enum(["planner", "executor", "reviewer", "merger"]);
 export type AgentRole = z.infer<typeof agentRoleSchema>;
 
 export const agentRuntimeModeSchema = z.enum(["managed", "external"]);
@@ -86,6 +114,7 @@ export type AgentTransport = z.infer<typeof agentTransportSchema>;
 export const handoffReasonSchema = z.enum([
   "rate_limit",
   "context_limit",
+  "budget_exceeded",
   "crash",
   "heartbeat_timeout",
   "user",
@@ -94,6 +123,42 @@ export type HandoffReason = z.infer<typeof handoffReasonSchema>;
 
 export const reviewDecisionSchema = z.enum(["approve", "bounce"]);
 export type ReviewDecision = z.infer<typeof reviewDecisionSchema>;
+
+export const humanReviewReasonSchema = z.enum([
+  "approval",
+  "bounce_escalation",
+  "merge_conflict",
+]);
+export type HumanReviewReason = z.infer<typeof humanReviewReasonSchema>;
+
+export const githubPullRequestReviewDecisionSchema = z.enum([
+  "APPROVED",
+  "CHANGES_REQUESTED",
+  "REVIEW_REQUIRED",
+  "COMMENTED",
+  "UNKNOWN",
+]);
+export type GithubPullRequestReviewDecision = z.infer<typeof githubPullRequestReviewDecisionSchema>;
+
+export const pullRequestProviderSchema = z.enum(["github"]);
+export type PullRequestProvider = z.infer<typeof pullRequestProviderSchema>;
+
+export const taskPullRequestSchema = z.object({
+  provider: pullRequestProviderSchema,
+  base_branch: z.string().min(1),
+  head_branch: z.string().min(1),
+  head_sha: z.string().nullable(),
+  number: z.number().int().positive().nullable(),
+  url: z.string().url().nullable(),
+  review_decision: githubPullRequestReviewDecisionSchema.nullable(),
+  merged_sha: z.string().nullable(),
+  last_synced_at: z.string().datetime().nullable(),
+  last_error: z.string().nullable(),
+});
+export type TaskPullRequest = z.infer<typeof taskPullRequestSchema>;
+
+export const mergeResultSchema = z.enum(["merged", "blocked", "reapproval_required"]);
+export type MergeResult = z.infer<typeof mergeResultSchema>;
 
 export const agentSchema = z.object({
   id: z.string().uuid(),
@@ -109,11 +174,38 @@ export const agentSchema = z.object({
   last_seen_at: z.string().datetime().nullable(),
   cooldown_until: z.string().datetime().nullable(),
   last_limit_reason: handoffReasonSchema.nullable(),
+  provider_family: agentProviderFamilySchema,
+  model_id: z.string().nullable(),
+  context_window: z.number().int().positive().nullable(),
+  cost_tier: agentCostTierSchema,
+  supports_tools: z.boolean(),
+  supports_patch: z.boolean(),
+  supports_review: z.boolean(),
+  max_concurrency: z.number().int().positive(),
+  fallback_priority: z.number().int().nonnegative(),
+  health_state: agentHealthStateSchema,
 });
 export type Agent = z.infer<typeof agentSchema>;
 
 const acceptanceStringSchema = z.string().trim().min(1);
 const acceptanceStringListSchema = z.array(acceptanceStringSchema);
+
+export const taskBudgetSchema = z.object({
+  soft_cost_usd: z.number().nonnegative().optional(),
+  hard_cost_usd: z.number().nonnegative().optional(),
+  soft_attempts: z.number().int().positive().optional(),
+  hard_attempts: z.number().int().positive().optional(),
+}).strict().refine(
+  (value) =>
+    value.soft_cost_usd !== undefined
+    || value.hard_cost_usd !== undefined
+    || value.soft_attempts !== undefined
+    || value.hard_attempts !== undefined,
+  {
+    message: "budget must define at least one soft/hard cost or attempt threshold",
+  },
+);
+export type TaskBudget = z.infer<typeof taskBudgetSchema>;
 
 export const createTaskAcceptanceSchema = z.object({
   deliverables: acceptanceStringListSchema.min(1),
@@ -169,6 +261,15 @@ export function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriteria | 
   return result.success ? result.data : null;
 }
 
+export function normalizeTaskBudget(raw: unknown): TaskBudget | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const result = taskBudgetSchema.safeParse(raw);
+  return result.success ? result.data : null;
+}
+
 export const taskSchema = z.object({
   id: z.string().uuid(),
   title: z.string().min(1),
@@ -179,7 +280,10 @@ export const taskSchema = z.object({
   branch_name: z.string().nullable(),
   worktree_path: z.string().nullable(),
   acceptance: acceptanceCriteriaSchema.nullable(),
+  budget: taskBudgetSchema.nullable(),
   review_bounce_count: z.number().int().min(0),
+  human_review_reason: humanReviewReasonSchema.nullable(),
+  pull_request: taskPullRequestSchema.nullable(),
   last_role: agentRoleSchema.nullable(),
   status_note: z.string().nullable(),
   created_at: z.string().datetime(),
@@ -194,9 +298,12 @@ export const artifactKindSchema = z.enum([
   "scratchpad",
   "next_steps",
   "test_output",
+  "checkpoint",
   "review_note",
   "execution_plan",
   "review_report",
+  "human_review_packet",
+  "merge_report",
   "approval_note",
 ]);
 export type ArtifactKind = z.infer<typeof artifactKindSchema>;
@@ -210,6 +317,16 @@ export const artifactSchema = z.object({
   created_at: z.string().datetime(),
 });
 export type Artifact = z.infer<typeof artifactSchema>;
+
+export const taskCheckpointSchema = z.object({
+  summary: z.string().trim().min(1),
+  files_touched: z.array(z.string().trim().min(1)).default([]),
+  tests_ran: z.array(z.string().trim().min(1)).default([]),
+  commands_ran: z.array(z.string().trim().min(1)).default([]),
+  next_steps: z.array(z.string().trim().min(1)).default([]),
+  risks: z.array(z.string().trim().min(1)).default([]),
+});
+export type TaskCheckpoint = z.infer<typeof taskCheckpointSchema>;
 
 export const taskAttachmentCategorySchema = z.enum([
   "image",
@@ -304,6 +421,44 @@ export const sessionMessageSchema = z.object({
 });
 export type SessionMessage = z.infer<typeof sessionMessageSchema>;
 
+export const taskAttemptOutcomeSchema = z.enum([
+  "completed",
+  "handoff",
+  "failed",
+  "approval_requested",
+  "budget_exceeded",
+  "cancelled",
+]);
+export type TaskAttemptOutcome = z.infer<typeof taskAttemptOutcomeSchema>;
+
+export const taskAttemptSchema = z.object({
+  id: z.string().uuid(),
+  task_id: z.string().uuid(),
+  agent_id: z.string().uuid(),
+  role: agentRoleSchema,
+  provider: agentProviderFamilySchema,
+  model: z.string().nullable(),
+  attempt_number: z.number().int().positive(),
+  started_at: z.string().datetime(),
+  ended_at: z.string().datetime().nullable(),
+  outcome: taskAttemptOutcomeSchema.nullable(),
+  handoff_reason: handoffReasonSchema.nullable(),
+  prompt_tokens: z.number().int().nonnegative().nullable(),
+  completion_tokens: z.number().int().nonnegative().nullable(),
+  estimated_cost_usd: z.number().nonnegative().nullable(),
+  latency_ms: z.number().int().nonnegative().nullable(),
+  checkpoint_artifact_id: z.string().uuid().nullable(),
+});
+export type TaskAttempt = z.infer<typeof taskAttemptSchema>;
+
+export const routingPolicySchema = z.object({
+  role: agentRoleSchema,
+  preferred_kinds: z.array(agentKindSchema).min(1),
+  max_cost_tier: agentCostTierSchema.optional(),
+  large_context_only: z.boolean().default(false),
+});
+export type RoutingPolicy = z.infer<typeof routingPolicySchema>;
+
 export const taskEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("create") }),
   z.object({ kind: z.literal("start_planning"), agent_id: z.string().uuid() }),
@@ -311,16 +466,28 @@ export const taskEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("start_execution"), agent_id: z.string().uuid() }),
   z.object({ kind: z.literal("execution_ready"), commit_sha: z.string().optional() }),
   z.object({ kind: z.literal("start_review"), agent_id: z.string().uuid() }),
+  z.object({ kind: z.literal("queue_merge") }),
+  z.object({ kind: z.literal("start_merge"), agent_id: z.string().uuid() }),
   z.object({
     kind: z.literal("review_decision"),
     decision: reviewDecisionSchema,
     note: z.string().optional(),
   }),
-  z.object({ kind: z.literal("enter_human_review"), note: z.string() }),
+  z.object({
+    kind: z.literal("enter_human_review"),
+    note: z.string(),
+    reason: humanReviewReasonSchema,
+  }),
   z.object({ kind: z.literal("return_to_todo"), note: z.string().optional() }),
   z.object({
+    kind: z.literal("merge_result"),
+    result: mergeResultSchema,
+    note: z.string().optional(),
+    merged_sha: z.string().optional(),
+  }),
+  z.object({
     kind: z.literal("report_limit"),
-    reason: z.enum(["rate_limit", "context_limit", "crash"]),
+    reason: handoffReasonSchema,
   }),
   z.object({ kind: z.literal("cancel") }),
   z.object({ kind: z.literal("claim"), agent_id: z.string().uuid() }),

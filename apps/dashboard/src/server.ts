@@ -10,7 +10,12 @@ import { promisify } from "node:util";
 import {
   AgentDeleteConflictError,
   AgentNotFoundError,
+  GitHubCliHelper,
+  type GitHubHelper,
   Orchestrator,
+  rankAgentsForTask,
+  roleForTask,
+  summarizeTaskBudget,
   WorktreeManager,
   openDatabase,
   type OpenDatabaseResult,
@@ -22,14 +27,19 @@ import type {
   AgentRuntimeMode,
   AgentSession,
   ApprovalRequest,
+  HumanReviewReason,
   SessionMessage,
+  TaskAttempt,
   TaskAttachment,
   Task,
+  TaskBudget,
+  TaskPullRequest,
   TaskStatus,
   TaskPriorityLabel,
 } from "@deltapilot/shared";
 import {
   normalizeAcceptanceCriteria,
+  normalizeTaskBudget,
   taskPriorityLabelFromRank,
   taskPriorityLabelSchema,
   taskPriorityRankFromLabel,
@@ -59,6 +69,7 @@ const TASK_STATUS_ORDER: TaskStatus[] = [
   "in_progress",
   "review",
   "human_review",
+  "merging",
   "done",
   "cancelled",
 ];
@@ -68,6 +79,7 @@ const MIME_TYPES = new Map<string, string>([
   [".js", "application/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"],
 ]);
 
 const MANAGED_COMMAND_DEFAULTS: Partial<Record<Agent["kind"], string>> = {
@@ -75,11 +87,17 @@ const MANAGED_COMMAND_DEFAULTS: Partial<Record<Agent["kind"], string>> = {
   "claude-code": "claude",
   "claude-sdk": "claude",
   openclaw: "openclaw gateway start",
+  ollama: "ollama run qwen2.5-coder:7b",
   opendevin: "opendevin",
   hermes: "hermes",
 };
 
-const TERMINAL_RELAUNCH_COMMANDS = new Set(["claude", "codex", "openclaw gateway start"]);
+const TERMINAL_RELAUNCH_COMMANDS = new Set([
+  "claude",
+  "codex",
+  "openclaw gateway start",
+  "ollama run qwen2.5-coder:7b",
+]);
 
 interface TaskRow {
   id: string;
@@ -91,7 +109,19 @@ interface TaskRow {
   branch_name: string | null;
   worktree_path: string | null;
   acceptance_json: string | null;
+  budget_json: string | null;
   review_bounce_count: number;
+  human_review_reason: string | null;
+  pr_provider: string | null;
+  pr_base_branch: string | null;
+  pr_head_branch: string | null;
+  pr_head_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_review_decision: string | null;
+  pr_merged_sha: string | null;
+  pr_last_synced_at: string | null;
+  pr_last_error: string | null;
   last_role: string | null;
   status_note: string | null;
   created_at: string;
@@ -115,6 +145,38 @@ interface AgentRow {
   last_seen_at: string | null;
   cooldown_until: string | null;
   last_limit_reason: string | null;
+  provider_family: Agent["provider_family"];
+  model_id: string | null;
+  context_window: number | null;
+  cost_tier: Agent["cost_tier"];
+  supports_tools: number;
+  supports_patch: number;
+  supports_review: number;
+  max_concurrency: number;
+  fallback_priority: number;
+  health_state: Agent["health_state"];
+}
+
+interface AttemptRow {
+  id: string;
+  task_id: string;
+  agent_id: string;
+  role: Agent["role"];
+  provider: Agent["provider_family"];
+  model: string | null;
+  attempt_number: number;
+  started_at: string;
+  ended_at: string | null;
+  outcome: string | null;
+  handoff_reason: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  estimated_cost_usd: string | null;
+  latency_ms: number | null;
+  checkpoint_artifact_id: string | null;
+  task_title: string | null;
+  agent_name: string | null;
+  agent_kind: Agent["kind"] | null;
 }
 
 interface TaskEventRow {
@@ -217,6 +279,7 @@ export interface DashboardServerOptions {
   dbPath: string;
   host?: string;
   port?: number;
+  githubHelper?: GitHubHelper;
   auth?: {
     username: string;
     password: string;
@@ -244,7 +307,10 @@ export interface DashboardTaskSummary {
   worktree_path: string | null;
   worktree_exists: boolean;
   acceptance: AcceptanceCriteria | null;
+  budget: TaskBudget | null;
   review_bounce_count: number;
+  human_review_reason: HumanReviewReason | null;
+  pull_request: TaskPullRequest | null;
   last_role: AgentRole | null;
   status_note: string | null;
   created_at: string;
@@ -258,6 +324,10 @@ export interface DashboardAgentSummary extends Agent {
   assigned_task_count: number;
   pending_approval_count: number;
   active_session_id: string | null;
+  attempt_count: number;
+  avg_latency_ms: number | null;
+  avg_cost_usd: number | null;
+  limit_hit_rate: number;
 }
 
 export interface DashboardTaskEvent {
@@ -301,6 +371,9 @@ export interface DashboardTaskDetail {
   artifacts: DashboardArtifact[];
   attachments: DashboardTaskAttachment[];
   handoffs: DashboardHandoff[];
+  attempts: DashboardRunSummary[];
+  candidate_pool: DashboardRoutingCandidate[];
+  budget_summary: DashboardBudgetSummary;
 }
 
 export interface DashboardTaskAttachment extends TaskAttachment {
@@ -328,6 +401,8 @@ export interface DashboardSessionSummary {
   last_seen_at: string | null;
   last_error: string | null;
   pending_approval_count: number;
+  active_attempt: DashboardRunSummary | null;
+  budget_summary: DashboardBudgetSummary | null;
 }
 
 export interface DashboardApprovalSummary {
@@ -353,6 +428,33 @@ export interface DashboardSessionDetail {
   log_content: string;
 }
 
+export interface DashboardBudgetSummary {
+  total_cost_usd: number;
+  total_attempts: number;
+  soft_cost_remaining_usd: number | null;
+  hard_cost_remaining_usd: number | null;
+  soft_attempts_remaining: number | null;
+  hard_attempts_remaining: number | null;
+  soft_exceeded: boolean;
+  hard_exceeded: boolean;
+}
+
+export interface DashboardRoutingCandidate {
+  agent_id: string;
+  agent_name: string | null;
+  kind: Agent["kind"];
+  role: Agent["role"];
+  score: number;
+  blocked: boolean;
+  reasons: string[];
+}
+
+export interface DashboardRunSummary extends TaskAttempt {
+  task_title: string | null;
+  agent_name: string | null;
+  agent_kind: Agent["kind"] | null;
+}
+
 export interface DashboardSnapshot {
   meta: {
     repo_root: string;
@@ -363,6 +465,8 @@ export interface DashboardSnapshot {
   tasks: DashboardTaskSummary[];
   agents: DashboardAgentSummary[];
   sessions: DashboardSessionSummary[];
+  approvals: DashboardApprovalSummary[];
+  runs: DashboardRunSummary[];
   recent_handoffs: DashboardHandoff[];
 }
 
@@ -374,6 +478,7 @@ interface DashboardContext {
   conn: OpenDatabaseResult;
   orch: Orchestrator;
   worktreeMgr: WorktreeManager;
+  githubHelper: GitHubHelper;
   interactiveProcesses: Map<string, InteractiveHandle>;
   options: Required<Pick<DashboardServerOptions, "repoRoot" | "dbPath">> & {
     auth?: DashboardServerOptions["auth"];
@@ -411,6 +516,7 @@ export async function startDashboardServer(
     conn,
     orch,
     worktreeMgr,
+    githubHelper: options.githubHelper ?? new GitHubCliHelper(),
     interactiveProcesses: new Map(),
     options: {
       repoRoot,
@@ -529,6 +635,11 @@ async function handleRequest(
 
   if (method === "GET" && pathname === "/api/approvals") {
     sendJson(res, 200, selectApprovals(context.conn.raw));
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/runs") {
+    sendJson(res, 200, selectRuns(context.conn.raw));
     return;
   }
 
@@ -701,6 +812,23 @@ async function handleRequest(
     return;
   }
 
+  const fallbackMatch = pathname.match(/^\/api\/sessions\/([0-9a-f-]+)\/fallback$/i);
+  if (method === "POST" && fallbackMatch) {
+    const sessionId = fallbackMatch[1];
+    if (!sessionId) throw new HttpError(400, "session id is required");
+    const session = context.orch.getAgentSession(sessionId);
+    if (!session.task_id) throw new HttpError(409, "session has no active task");
+    const agent = context.orch.getAgent(session.agent_id);
+    await context.orch.reportLimit(session.task_id, agent.id, "user");
+    context.orch.updateAgentSession(sessionId, {
+      status: "ready",
+      taskId: null,
+      lastError: "Fallback requested by user",
+    });
+    sendJson(res, 200, await loadSessionDetail(context, sessionId));
+    return;
+  }
+
   const approveMatch = pathname.match(/^\/api\/approvals\/([0-9a-f-]+)\/approve$/i);
   if (method === "POST" && approveMatch) {
     const approvalId = approveMatch[1];
@@ -758,7 +886,7 @@ async function handleRequest(
     return;
   }
 
-  if (method === "GET" && (pathname === "/app.js" || pathname === "/styles.css")) {
+  if (method === "GET" && /^\/[a-zA-Z0-9._-]+$/.test(pathname)) {
     await sendStaticFile(res, pathname.slice(1));
     return;
   }
@@ -768,6 +896,9 @@ async function handleRequest(
 
 async function sendStaticFile(res: ServerResponse, relativePath: string): Promise<void> {
   const filePath = path.join(publicDir, relativePath);
+  if (!existsSync(filePath)) {
+    throw new HttpError(404, `static asset not found: ${relativePath}`);
+  }
   const ext = path.extname(filePath);
   const content = await readFile(filePath);
   res.statusCode = 200;
@@ -860,6 +991,8 @@ function loadDashboardSnapshot(context: DashboardContext): DashboardSnapshot {
   const tasks = selectTasks(context.conn.raw);
   const agents = selectAgents(context.conn.raw);
   const sessions = selectSessions(context.conn.raw, { managedOnly: true });
+  const approvals = selectApprovals(context.conn.raw);
+  const runs = selectRuns(context.conn.raw);
   const recentHandoffs = selectHandoffs(context.conn.raw).slice(0, 12);
 
   const stats = Object.fromEntries(
@@ -879,6 +1012,8 @@ function loadDashboardSnapshot(context: DashboardContext): DashboardSnapshot {
     tasks,
     agents,
     sessions,
+    approvals,
+    runs,
     recent_handoffs: recentHandoffs,
   };
 }
@@ -895,6 +1030,9 @@ async function loadTaskDetail(
     handoffs: selectHandoffs(context.conn.raw, taskId),
     artifacts: await selectArtifacts(context.conn.raw, taskId),
     attachments: await selectTaskAttachments(context.conn.raw, taskId),
+    attempts: selectRuns(context.conn.raw, { taskId }),
+    candidate_pool: buildCandidatePool(context.conn.raw, task),
+    budget_summary: toDashboardBudgetSummary(task.budget, selectAttempts(context.conn.raw, { taskId })),
   };
 }
 
@@ -1061,6 +1199,7 @@ async function createTaskFromBody(
     brief?: unknown;
     priority?: unknown;
     acceptance?: unknown;
+    budget?: unknown;
   };
 
   const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
@@ -1069,12 +1208,14 @@ async function createTaskFromBody(
   const brief = typeof parsed.brief === "string" ? parsed.brief.trim() : "";
   const priority = parsePriority(parsed.priority);
   const acceptance = parseAcceptance(parsed.acceptance);
+  const budget = parseTaskBudget(parsed.budget);
 
   return context.orch.createTask({
     title,
     brief,
     ...(priority !== undefined ? { priority } : {}),
     ...(acceptance ? { acceptance } : {}),
+    ...(budget ? { budget } : {}),
   });
 }
 
@@ -1091,6 +1232,16 @@ async function registerAgentFromBody(
     enabled?: unknown;
     command?: unknown;
     endpoint?: unknown;
+    provider_family?: unknown;
+    model_id?: unknown;
+    context_window?: unknown;
+    cost_tier?: unknown;
+    supports_tools?: unknown;
+    supports_patch?: unknown;
+    supports_review?: unknown;
+    max_concurrency?: unknown;
+    fallback_priority?: unknown;
+    health_state?: unknown;
   };
 
   const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
@@ -1123,6 +1274,16 @@ async function registerAgentFromBody(
       enabled,
       ...(command ? { command } : {}),
       ...(endpoint ? { endpoint } : {}),
+      ...(typeof parsed.provider_family === "string" ? { providerFamily: parsed.provider_family as Agent["provider_family"] } : {}),
+      ...(typeof parsed.model_id === "string" ? { modelId: parsed.model_id.trim() || null } : {}),
+      ...(typeof parsed.context_window === "number" ? { contextWindow: parsed.context_window } : {}),
+      ...(typeof parsed.cost_tier === "string" ? { costTier: parsed.cost_tier as Agent["cost_tier"] } : {}),
+      ...(parsed.supports_tools !== undefined ? { supportsTools: Boolean(parsed.supports_tools) } : {}),
+      ...(parsed.supports_patch !== undefined ? { supportsPatch: Boolean(parsed.supports_patch) } : {}),
+      ...(parsed.supports_review !== undefined ? { supportsReview: Boolean(parsed.supports_review) } : {}),
+      ...(typeof parsed.max_concurrency === "number" ? { maxConcurrency: parsed.max_concurrency } : {}),
+      ...(typeof parsed.fallback_priority === "number" ? { fallbackPriority: parsed.fallback_priority } : {}),
+      ...(typeof parsed.health_state === "string" ? { healthState: parsed.health_state as Agent["health_state"] } : {}),
     });
   } catch (error) {
     throw new HttpError(400, error instanceof Error ? error.message : String(error));
@@ -1142,6 +1303,16 @@ function updateAgentFromBody(
     command?: unknown;
     endpoint?: unknown;
     cooldown_until?: unknown;
+    provider_family?: unknown;
+    model_id?: unknown;
+    context_window?: unknown;
+    cost_tier?: unknown;
+    supports_tools?: unknown;
+    supports_patch?: unknown;
+    supports_review?: unknown;
+    max_concurrency?: unknown;
+    fallback_priority?: unknown;
+    health_state?: unknown;
   };
 
   try {
@@ -1166,6 +1337,20 @@ function updateAgentFromBody(
                 : null,
           }
         : {}),
+      ...(typeof parsed.provider_family === "string"
+        ? { providerFamily: parsed.provider_family as Agent["provider_family"] }
+        : {}),
+      ...(parsed.model_id !== undefined
+        ? { modelId: typeof parsed.model_id === "string" ? parsed.model_id.trim() || null : null }
+        : {}),
+      ...(typeof parsed.context_window === "number" ? { contextWindow: parsed.context_window } : {}),
+      ...(typeof parsed.cost_tier === "string" ? { costTier: parsed.cost_tier as Agent["cost_tier"] } : {}),
+      ...(parsed.supports_tools !== undefined ? { supportsTools: Boolean(parsed.supports_tools) } : {}),
+      ...(parsed.supports_patch !== undefined ? { supportsPatch: Boolean(parsed.supports_patch) } : {}),
+      ...(parsed.supports_review !== undefined ? { supportsReview: Boolean(parsed.supports_review) } : {}),
+      ...(typeof parsed.max_concurrency === "number" ? { maxConcurrency: parsed.max_concurrency } : {}),
+      ...(typeof parsed.fallback_priority === "number" ? { fallbackPriority: parsed.fallback_priority } : {}),
+      ...(typeof parsed.health_state === "string" ? { healthState: parsed.health_state as Agent["health_state"] } : {}),
     });
   } catch (error) {
     throw new HttpError(400, error instanceof Error ? error.message : String(error));
@@ -1213,7 +1398,11 @@ async function applyDashboardAction(
       return;
     }
     case "approve":
-      await context.orch.reviewDecision(taskId, { decision: "approve" });
+      await approveTaskForHumanReviewFromDashboard(
+        context,
+        taskId,
+        typeof parsed.note === "string" ? parsed.note.trim() : "",
+      );
       return;
     case "bounce": {
       const note = typeof parsed.note === "string" ? parsed.note.trim() : "";
@@ -1233,6 +1422,91 @@ async function applyDashboardAction(
     default:
       throw new HttpError(400, `unsupported action kind: ${parsed.kind}`);
   }
+}
+
+async function approveTaskForHumanReviewFromDashboard(
+  context: DashboardContext,
+  taskId: string,
+  note: string,
+): Promise<void> {
+  const task = await context.orch.ensureTaskWorktree(taskId);
+  if (task.status !== "review") {
+    throw new HttpError(400, `Task ${taskId} is not in review`);
+  }
+  if (!task.worktree_path) {
+    throw new HttpError(400, `Task ${taskId} has no worktree available`);
+  }
+
+  try {
+    const pullRequest = await context.githubHelper.ensurePullRequest({
+      repoRoot: context.options.repoRoot,
+      worktreePath: task.worktree_path,
+      branchName: task.branch_name ?? `deltapilot/task/${task.id}`,
+      title: task.title,
+      body: buildPullRequestBody(task, note || null),
+    });
+    const diffStat = await context.githubHelper.diffStat(task.worktree_path, pullRequest.base_branch);
+    const packet = context.githubHelper.buildHumanReviewPacket({
+      worktreePath: task.worktree_path,
+      branchName: pullRequest.head_branch,
+      acceptance: task.acceptance,
+      reviewNote: note || null,
+      diffStat,
+      pullRequest,
+    });
+    await context.orch.writeArtifact(task.id, "human_review_packet", packet);
+    await context.orch.approveForHumanReview(task.id, {
+      note: note || "Approved for human review.",
+      reason: "approval",
+      pullRequest: toPullRequestUpdate(pullRequest),
+      preserveWorktree: true,
+    });
+  } catch (error) {
+    const message = `Failed to publish the PR for human review: ${error instanceof Error ? error.message : String(error)}`;
+    await context.orch.failHumanReviewApproval(task.id, message, null, {
+      lastError: message,
+      lastSyncedAt: new Date().toISOString(),
+    });
+  }
+}
+
+function buildPullRequestBody(task: Task, reviewNote: string | null): string {
+  const lines = [
+    "## Task",
+    "",
+    task.brief || task.title,
+    "",
+  ];
+
+  if (task.acceptance?.deliverables.length) {
+    lines.push("## Deliverables", "");
+    for (const item of task.acceptance.deliverables) {
+      lines.push(`- ${item}`);
+    }
+    lines.push("");
+  }
+
+  if (task.acceptance?.success_test) {
+    lines.push("## Success Test", "", task.acceptance.success_test, "");
+  }
+
+  lines.push("## Reviewer Note", "", reviewNote?.trim() || "Approved for human review.", "");
+  return lines.join("\n");
+}
+
+function toPullRequestUpdate(pullRequest: TaskPullRequest) {
+  return {
+    provider: pullRequest.provider,
+    baseBranch: pullRequest.base_branch,
+    headBranch: pullRequest.head_branch,
+    headSha: pullRequest.head_sha,
+    number: pullRequest.number,
+    url: pullRequest.url,
+    reviewDecision: pullRequest.review_decision,
+    mergedSha: pullRequest.merged_sha,
+    lastSyncedAt: pullRequest.last_synced_at,
+    lastError: pullRequest.last_error,
+  } as const;
 }
 
 function parsePriority(raw: unknown): number | TaskPriorityLabel | undefined {
@@ -1302,6 +1576,57 @@ function parseAcceptance(raw: unknown): AcceptanceCriteria | undefined {
     files_in_scope: filesInScope,
     ...(successTest ? { success_test: successTest } : {}),
   };
+}
+
+function parseTaskBudget(raw: unknown): TaskBudget | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const candidate = raw as {
+    soft_cost_usd?: unknown;
+    hard_cost_usd?: unknown;
+    soft_attempts?: unknown;
+    hard_attempts?: unknown;
+    soft_cost_limit_usd?: unknown;
+    hard_cost_limit_usd?: unknown;
+    soft_attempt_limit?: unknown;
+    hard_attempt_limit?: unknown;
+  };
+
+  const parseNumber = (value: unknown): number | undefined => {
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = Number.parseFloat(value.trim());
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    throw new HttpError(400, "budget fields must be numeric");
+  };
+
+  const parseInteger = (value: unknown): number | undefined => {
+    const parsed = parseNumber(value);
+    if (parsed === undefined) return undefined;
+    if (!Number.isInteger(parsed)) {
+      throw new HttpError(400, "attempt budget fields must be integers");
+    }
+    return parsed;
+  };
+
+  const budgetCandidate = {
+    soft_cost_usd: parseNumber(candidate.soft_cost_usd ?? candidate.soft_cost_limit_usd),
+    hard_cost_usd: parseNumber(candidate.hard_cost_usd ?? candidate.hard_cost_limit_usd),
+    soft_attempts: parseInteger(candidate.soft_attempts ?? candidate.soft_attempt_limit),
+    hard_attempts: parseInteger(candidate.hard_attempts ?? candidate.hard_attempt_limit),
+  };
+
+  if (Object.values(budgetCandidate).every((value) => value === undefined)) {
+    return undefined;
+  }
+
+  try {
+    return normalizeTaskBudget(budgetCandidate) ?? undefined;
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : "invalid task budget");
+  }
 }
 
 function moveTaskFromDashboard(
@@ -1445,8 +1770,9 @@ function selectTasks(raw: OpenDatabaseResult["raw"]): DashboardTaskSummary[] {
           WHEN 'in_progress' THEN 2
           WHEN 'review' THEN 3
           WHEN 'human_review' THEN 4
-          WHEN 'done' THEN 5
-          ELSE 6
+          WHEN 'merging' THEN 5
+          WHEN 'done' THEN 6
+          ELSE 7
         END,
         tasks.priority DESC,
         tasks.created_at ASC
@@ -1506,7 +1832,36 @@ function selectAgents(raw: OpenDatabaseResult["raw"]): DashboardAgentSummary[] {
             AND agent_sessions.ended_at IS NULL
           ORDER BY agent_sessions.started_at DESC
           LIMIT 1
-        ) AS active_session_id
+        ) AS active_session_id,
+        (
+          SELECT COUNT(*)
+          FROM task_attempts
+          WHERE task_attempts.agent_id = agents.id
+        ) AS attempt_count,
+        (
+          SELECT AVG(latency_ms)
+          FROM task_attempts
+          WHERE task_attempts.agent_id = agents.id
+            AND task_attempts.latency_ms IS NOT NULL
+        ) AS avg_latency_ms,
+        (
+          SELECT AVG(CAST(estimated_cost_usd AS REAL))
+          FROM task_attempts
+          WHERE task_attempts.agent_id = agents.id
+            AND task_attempts.estimated_cost_usd IS NOT NULL
+        ) AS avg_cost_usd,
+        (
+          SELECT COALESCE(AVG(
+            CASE
+              WHEN task_attempts.handoff_reason IN ('rate_limit', 'context_limit', 'budget_exceeded')
+              THEN 1.0
+              ELSE 0.0
+            END
+          ), 0)
+          FROM task_attempts
+          WHERE task_attempts.agent_id = agents.id
+            AND task_attempts.ended_at IS NOT NULL
+        ) AS limit_hit_rate
       FROM agents
       LEFT JOIN tasks ON tasks.assigned_agent_id = agents.id
       GROUP BY agents.id
@@ -1517,6 +1872,10 @@ function selectAgents(raw: OpenDatabaseResult["raw"]): DashboardAgentSummary[] {
       assigned_task_count: number;
       pending_approval_count: number;
       active_session_id: string | null;
+      attempt_count: number;
+      avg_latency_ms: number | null;
+      avg_cost_usd: number | null;
+      limit_hit_rate: number | null;
     }>;
 
   return rows.map((row) => ({
@@ -1524,6 +1883,10 @@ function selectAgents(raw: OpenDatabaseResult["raw"]): DashboardAgentSummary[] {
     assigned_task_count: row.assigned_task_count,
     pending_approval_count: row.pending_approval_count,
     active_session_id: row.active_session_id,
+    attempt_count: row.attempt_count,
+    avg_latency_ms: row.avg_latency_ms,
+    avg_cost_usd: row.avg_cost_usd,
+    limit_hit_rate: row.limit_hit_rate ?? 0,
   }));
 }
 
@@ -1650,6 +2013,98 @@ function selectHandoffs(
   }));
 }
 
+function selectAttempts(
+  raw: OpenDatabaseResult["raw"],
+  filter?: { taskId?: string; agentId?: string; activeOnly?: boolean },
+): TaskAttempt[] {
+  let sql = `
+    SELECT task_attempts.*
+    FROM task_attempts
+  `;
+  const args: Array<string> = [];
+  const where: string[] = [];
+  if (filter?.taskId) {
+    where.push("task_attempts.task_id = ?");
+    args.push(filter.taskId);
+  }
+  if (filter?.agentId) {
+    where.push("task_attempts.agent_id = ?");
+    args.push(filter.agentId);
+  }
+  if (filter?.activeOnly) {
+    where.push("task_attempts.ended_at IS NULL");
+  }
+  if (where.length > 0) {
+    sql += ` WHERE ${where.join(" AND ")}`;
+  }
+  sql += " ORDER BY task_attempts.started_at DESC";
+
+  const rows = raw.prepare(sql).all(...args) as AttemptRow[];
+  return rows.map(mapAttempt);
+}
+
+function selectRuns(
+  raw: OpenDatabaseResult["raw"],
+  filter?: { taskId?: string },
+): DashboardRunSummary[] {
+  const rows = raw
+    .prepare(
+      `
+      SELECT
+        task_attempts.*,
+        tasks.title AS task_title,
+        agents.name AS agent_name,
+        agents.kind AS agent_kind
+      FROM task_attempts
+      JOIN tasks ON tasks.id = task_attempts.task_id
+      JOIN agents ON agents.id = task_attempts.agent_id
+      ${filter?.taskId ? "WHERE task_attempts.task_id = ?" : ""}
+      ORDER BY task_attempts.started_at DESC
+      `,
+    )
+    .all(...(filter?.taskId ? [filter.taskId] : [])) as AttemptRow[];
+
+  return rows.map((row) => ({
+    ...mapAttempt(row),
+    task_title: row.task_title,
+    agent_name: row.agent_name,
+    agent_kind: row.agent_kind,
+  }));
+}
+
+function buildCandidatePool(
+  raw: OpenDatabaseResult["raw"],
+  task: DashboardTaskSummary,
+): DashboardRoutingCandidate[] {
+  const role = roleForTask(task);
+  if (!role) return [];
+
+  const agents = selectAgents(raw)
+    .filter((agent) => agent.runtime_mode === "managed")
+    .filter((agent) => agent.role === role);
+  const activeAssignments = Object.fromEntries(
+    agents.map((agent) => [agent.id, agent.assigned_task_count]),
+  );
+  const ranked = rankAgentsForTask({
+    task,
+    role,
+    agents,
+    attempts: selectAttempts(raw, { taskId: task.id }),
+    activeAssignments,
+  });
+
+  const agentMap = new Map(agents.map((agent) => [agent.id, agent]));
+  return ranked.map((candidate) => ({
+    agent_id: candidate.agent_id,
+    agent_name: agentMap.get(candidate.agent_id)?.name ?? null,
+    kind: agentMap.get(candidate.agent_id)?.kind ?? "other",
+    role: agentMap.get(candidate.agent_id)?.role ?? role,
+    score: candidate.score,
+    blocked: candidate.blocked,
+    reasons: candidate.reasons,
+  }));
+}
+
 function selectSessions(
   raw: OpenDatabaseResult["raw"],
   options: { managedOnly?: boolean } = {},
@@ -1682,7 +2137,7 @@ function selectSessions(
     )
     .all() as SessionRow[];
 
-  return rows.map(mapSession);
+  return rows.map((row) => mapSession(row, raw));
 }
 
 function selectSessionById(
@@ -1716,7 +2171,7 @@ function selectSessionById(
     )
     .get(sessionId) as SessionRow | undefined;
 
-  return row ? mapSession(row) : null;
+  return row ? mapSession(row, raw) : null;
 }
 
 function selectApprovals(
@@ -1763,6 +2218,16 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
       acceptance = null;
     }
   }
+  let budget: TaskBudget | null = null;
+  if (row.budget_json !== null) {
+    try {
+      budget = normalizeTaskBudget(JSON.parse(row.budget_json));
+    } catch {
+      budget = null;
+    }
+  }
+
+  const pullRequest = buildTaskPullRequestFromRow(row);
 
   return {
     id: row.id,
@@ -1777,7 +2242,10 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
     worktree_path: row.worktree_path,
     worktree_exists: row.worktree_path ? existsSync(row.worktree_path) : false,
     acceptance,
+    budget,
     review_bounce_count: row.review_bounce_count,
+    human_review_reason: (row.human_review_reason as HumanReviewReason | null) ?? null,
+    pull_request: pullRequest,
     last_role: row.last_role as AgentRole | null,
     status_note: row.status_note,
     created_at: row.created_at,
@@ -1785,6 +2253,22 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
     claimed_at: row.claimed_at,
     last_heartbeat_at: row.last_heartbeat_at,
     archived_at: row.archived_at,
+  };
+}
+
+function buildTaskPullRequestFromRow(row: TaskRow): TaskPullRequest | null {
+  if (!row.pr_provider || !row.pr_base_branch || !row.pr_head_branch) return null;
+  return {
+    provider: "github",
+    base_branch: row.pr_base_branch,
+    head_branch: row.pr_head_branch,
+    head_sha: row.pr_head_sha,
+    number: row.pr_number,
+    url: row.pr_url,
+    review_decision: row.pr_review_decision as TaskPullRequest["review_decision"],
+    merged_sha: row.pr_merged_sha,
+    last_synced_at: row.pr_last_synced_at,
+    last_error: row.pr_last_error,
   };
 }
 
@@ -1825,6 +2309,16 @@ function mapAgent(row: AgentRow): Agent {
     last_seen_at: row.last_seen_at,
     cooldown_until: row.cooldown_until,
     last_limit_reason: row.last_limit_reason as Agent["last_limit_reason"],
+    provider_family: row.provider_family,
+    model_id: row.model_id,
+    context_window: row.context_window,
+    cost_tier: row.cost_tier,
+    supports_tools: Boolean(row.supports_tools),
+    supports_patch: Boolean(row.supports_patch),
+    supports_review: Boolean(row.supports_review),
+    max_concurrency: row.max_concurrency,
+    fallback_priority: row.fallback_priority,
+    health_state: row.health_state,
   };
   const effectiveCommand = row.command ?? resolveManagedCommandDefault(row.kind, row.runtime_mode);
   if (effectiveCommand !== undefined) agent.command = effectiveCommand;
@@ -1832,7 +2326,15 @@ function mapAgent(row: AgentRow): Agent {
   return agent;
 }
 
-function mapSession(row: SessionRow): DashboardSessionSummary {
+function mapSession(row: SessionRow, raw: OpenDatabaseResult["raw"]): DashboardSessionSummary {
+  const activeAttempt = row.task_id
+    ? selectRuns(raw, { taskId: row.task_id }).find((attempt) => attempt.ended_at === null && attempt.agent_id === row.agent_id) ?? null
+    : null;
+  const task = row.task_id ? selectTaskById(raw, row.task_id) : null;
+  const budgetSummary = task
+    ? toDashboardBudgetSummary(task.budget, selectAttempts(raw, { taskId: task.id }))
+    : null;
+
   return {
     id: row.id,
     agent_id: row.agent_id,
@@ -1853,6 +2355,46 @@ function mapSession(row: SessionRow): DashboardSessionSummary {
     last_seen_at: row.last_seen_at,
     last_error: row.last_error,
     pending_approval_count: row.pending_approval_count,
+    active_attempt: activeAttempt,
+    budget_summary: budgetSummary,
+  };
+}
+
+function mapAttempt(row: AttemptRow): TaskAttempt {
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    agent_id: row.agent_id,
+    role: row.role,
+    provider: row.provider,
+    model: row.model,
+    attempt_number: row.attempt_number,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    outcome: row.outcome as TaskAttempt["outcome"],
+    handoff_reason: row.handoff_reason as TaskAttempt["handoff_reason"],
+    prompt_tokens: row.prompt_tokens,
+    completion_tokens: row.completion_tokens,
+    estimated_cost_usd: row.estimated_cost_usd === null ? null : Number.parseFloat(row.estimated_cost_usd),
+    latency_ms: row.latency_ms,
+    checkpoint_artifact_id: row.checkpoint_artifact_id,
+  };
+}
+
+function toDashboardBudgetSummary(
+  budget: TaskBudget | null,
+  attempts: TaskAttempt[],
+): DashboardBudgetSummary {
+  const summary = summarizeTaskBudget(budget, attempts);
+  return {
+    total_cost_usd: summary.totalCostUsd,
+    total_attempts: summary.totalAttempts,
+    soft_cost_remaining_usd: summary.softCostRemainingUsd,
+    hard_cost_remaining_usd: summary.hardCostRemainingUsd,
+    soft_attempts_remaining: summary.softAttemptsRemaining,
+    hard_attempts_remaining: summary.hardAttemptsRemaining,
+    soft_exceeded: summary.softExceeded,
+    hard_exceeded: summary.hardExceeded,
   };
 }
 

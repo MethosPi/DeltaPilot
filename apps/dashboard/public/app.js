@@ -4,6 +4,7 @@ const STATUS_ORDER = [
   "in_progress",
   "review",
   "human_review",
+  "merging",
   "done",
   "cancelled",
 ];
@@ -14,6 +15,7 @@ const STATUS_TITLES = {
   in_progress: "In Progress",
   review: "Review",
   human_review: "Human Review",
+  merging: "Merging",
   done: "Done",
   cancelled: "Cancelled",
 };
@@ -25,8 +27,11 @@ const EVENT_TITLES = {
   start_execution: "Executor Claimed",
   execution_ready: "Submitted For Review",
   start_review: "Reviewer Claimed",
+  queue_merge: "Queued For Merge",
+  start_merge: "Merger Claimed",
   review_decision: "Review Decision",
   enter_human_review: "Escalated To Human Review",
+  merge_result: "Merge Result",
   return_to_todo: "Returned To To Do",
   report_limit: "Reported Limit",
   cancel: "Cancelled",
@@ -36,6 +41,7 @@ const EVENT_TITLES = {
 };
 
 const BOARD_EVENT_PREVIEW_COUNT = 4;
+const POLL_INTERVAL_MS = 10_000;
 const TERMINAL_THEME_STORAGE_KEY = "deltapilot-terminal-theme";
 const TERMINAL_THEME_OPTIONS = {
   white: "White",
@@ -54,10 +60,17 @@ const MANAGED_COMMAND_PRESETS = {
   "claude-code": ["claude"],
   "claude-sdk": ["claude"],
   openclaw: ["openclaw gateway start"],
+  ollama: ["ollama run qwen2.5-coder:7b"],
   opendevin: ["opendevin"],
   hermes: ["hermes"],
   mock: [],
   other: [],
+};
+
+const HUMAN_REVIEW_REASON_TITLES = {
+  approval: "Awaiting PR Approval",
+  bounce_escalation: "Escalated After Repeated Bounce",
+  merge_conflict: "Merge Conflict",
 };
 
 const state = {
@@ -90,6 +103,7 @@ const refreshButton = document.querySelector("#refreshButton");
 const createTaskForm = document.querySelector("#createTaskForm");
 const registerAgentForm = document.querySelector("#registerAgentForm");
 const agentsList = document.querySelector("#agentsList");
+const runsList = document.querySelector("#runsList");
 const sessionsList = document.querySelector("#sessionsList");
 const sessionDetail = document.querySelector("#sessionDetail");
 const approvalList = document.querySelector("#approvalList");
@@ -122,27 +136,28 @@ registerAgentFields.runtimeMode.addEventListener("change", () => syncRegisterAge
 tabBar.querySelectorAll("[data-tab]").forEach((button) => {
   button.addEventListener("click", () => {
     state.activeTab = button.dataset.tab;
-    renderTabs();
+    void refreshAll({ quiet: true }).catch(reportError);
   });
 });
 
 setInterval(() => {
   void refreshAll({ quiet: true }).catch(reportError);
-}, 5000);
+}, POLL_INTERVAL_MS);
 
 applyTerminalTheme();
 syncRegisterAgentForm({ autofill: true });
 void refreshAll().catch(reportError);
 
 async function refreshAll(options = {}) {
-  const [snapshot, approvals] = await Promise.all([
-    fetchJson("/api/dashboard"),
-    fetchJson("/api/approvals"),
-  ]);
+  const snapshot = await fetchJson("/api/dashboard");
   state.snapshot = snapshot;
-  state.approvals = approvals;
+  state.approvals = snapshot.approvals ?? [];
 
   syncSelectedTaskId(snapshot);
+
+  if (state.taskDetail && state.taskDetail.task.id !== state.selectedTaskId) {
+    state.taskDetail = null;
+  }
 
   if (!state.selectedSessionId) {
     state.selectedSessionId = snapshot.sessions[0]?.id ?? null;
@@ -150,11 +165,16 @@ async function refreshAll(options = {}) {
     state.selectedSessionId = snapshot.sessions[0]?.id ?? null;
   }
 
-  await refreshSelectedTaskDetail();
+  if (state.activeTab === "board") {
+    await refreshSelectedTaskDetail();
+  }
 
-  if (state.selectedSessionId) {
+  if (
+    state.activeTab === "sessions" &&
+    state.selectedSessionId
+  ) {
     state.sessionDetail = await fetchJson(`/api/sessions/${state.selectedSessionId}`);
-  } else {
+  } else if (!state.selectedSessionId) {
     state.sessionDetail = null;
   }
 
@@ -208,8 +228,8 @@ async function refreshSelectedTaskDetail() {
 async function selectTask(taskId) {
   state.selectedTaskId = taskId;
   await refreshSelectedTaskDetail();
-  renderBoard();
-  renderTaskDetail();
+  state.activeTab = "board";
+  render();
 }
 
 async function setBoardView(view) {
@@ -230,6 +250,12 @@ async function setBoardView(view) {
 async function createTask() {
   const form = new FormData(createTaskForm);
   const attachments = Array.from(createTaskForm.querySelector('input[name="attachments"]').files ?? []);
+  const budget = compactObject({
+    soft_attempts: parseOptionalInteger(form.get("soft_attempt_limit")),
+    hard_attempts: parseOptionalInteger(form.get("hard_attempt_limit")),
+    soft_cost_usd: parseOptionalNumber(form.get("soft_cost_limit_usd")),
+    hard_cost_usd: parseOptionalNumber(form.get("hard_cost_limit_usd")),
+  });
   const payload = {
     title: String(form.get("title") ?? "").trim(),
     brief: String(form.get("brief") ?? "").trim(),
@@ -237,6 +263,7 @@ async function createTask() {
     acceptance: {
       deliverables: splitLines(form.get("deliverables")),
     },
+    ...(Object.keys(budget).length > 0 ? { budget } : {}),
   };
 
   const detail = await fetchJson("/api/tasks", {
@@ -266,11 +293,21 @@ async function registerAgent() {
     transport: String(form.get("transport") ?? "").trim(),
     command: String(form.get("command") ?? "").trim(),
     endpoint: String(form.get("endpoint") ?? "").trim(),
+    provider_family: String(form.get("provider_family") ?? "").trim(),
+    model_id: String(form.get("model_id") ?? "").trim(),
+    context_window: parseOptionalInteger(form.get("context_window")),
+    cost_tier: String(form.get("cost_tier") ?? "").trim(),
+    supports_tools: form.get("supports_tools") === "on",
+    supports_patch: form.get("supports_patch") === "on",
+    supports_review: form.get("supports_review") === "on",
+    max_concurrency: parseOptionalInteger(form.get("max_concurrency")),
+    fallback_priority: parseOptionalInteger(form.get("fallback_priority")),
+    health_state: String(form.get("health_state") ?? "").trim(),
   };
 
   const agent = await fetchJson("/api/agents", {
     method: "POST",
-    body: JSON.stringify(payload),
+    body: JSON.stringify(compactObject(payload)),
   });
 
   registerAgentForm.reset();
@@ -293,6 +330,7 @@ function render() {
   renderTaskDetail();
   renderHandoffs();
   renderAgents();
+  renderRuns();
   renderApprovals();
   renderSessions();
   renderSessionDetail();
@@ -333,6 +371,14 @@ function renderStats() {
     <span class="stat-item">
       Archived
       <strong>${archivedCount}</strong>
+    </span>
+    <span class="stat-item">
+      Active Runs
+      <strong>${state.snapshot.runs.filter((run) => run.ended_at === null).length}</strong>
+    </span>
+    <span class="stat-item">
+      Pending Approvals
+      <strong>${state.approvals.filter((approval) => approval.status === "pending").length}</strong>
     </span>
   `;
 }
@@ -482,7 +528,16 @@ function renderTaskDetail() {
     return;
   }
 
-  const { task, events, artifacts, attachments, handoffs } = state.taskDetail;
+  const {
+    task,
+    events,
+    artifacts,
+    attachments,
+    handoffs,
+    attempts,
+    candidate_pool: candidatePool,
+    budget_summary: budgetSummary,
+  } = state.taskDetail;
   const isArchived = Boolean(task.archived_at);
   const eventsExpanded = Boolean(state.expandedTaskEvents[task.id]);
   const shouldCollapseEvents = events.length > BOARD_EVENT_PREVIEW_COUNT;
@@ -506,6 +561,9 @@ function renderTaskDetail() {
       </section>
     `
     : "";
+  const humanReviewPacket = artifacts.find((artifact) => artifact.kind === "human_review_packet") ?? null;
+  const mergeReport = artifacts.find((artifact) => artifact.kind === "merge_report") ?? null;
+  const reviewPanel = renderReviewPanel(task, humanReviewPacket, mergeReport);
 
   taskDetail.className = "task-detail";
   taskDetail.innerHTML = `
@@ -530,13 +588,18 @@ function renderTaskDetail() {
         <span><strong>Assigned</strong> ${task.assigned_agent_name ? escapeHtml(task.assigned_agent_name) : "unassigned"}</span>
         <span><strong>Last Role</strong> ${task.last_role ? escapeHtml(task.last_role) : "none"}</span>
         <span><strong>Review Bounces</strong> ${task.review_bounce_count}</span>
+        <span><strong>Human Review Reason</strong> ${task.human_review_reason ? escapeHtml(humanReviewReasonTitle(task.human_review_reason)) : "none"}</span>
         <span><strong>Branch</strong> ${task.branch_name ? escapeHtml(task.branch_name) : "none"}</span>
         <span><strong>Worktree</strong> ${task.worktree_exists ? "present" : "missing"}</span>
       </div>
       <p class="muted path-line">${task.worktree_path ? escapeHtml(task.worktree_path) : "No active worktree path."}</p>
     </section>
 
+    ${renderBudgetSection(task, budgetSummary)}
+    ${renderCandidatePoolSection(candidatePool)}
+    ${renderAttemptsSection(attempts)}
     ${acceptance}
+    ${reviewPanel}
 
     ${renderAttachmentsSection(task, attachments)}
 
@@ -649,6 +712,8 @@ function renderTaskDetail() {
     const files = Array.from(attachmentForm.querySelector('input[name="attachments"]').files ?? []);
     void uploadAttachmentsForSelectedTask(files).catch(reportError);
   });
+
+  bindOpenTaskButtons(taskDetail);
 }
 
 function renderAttachmentsSection(task, attachments) {
@@ -684,6 +749,137 @@ function renderAttachmentsSection(task, attachments) {
       ${attachments.length > 0
         ? `<div class="attachment-list">${attachments.map((attachment) => renderAttachmentCard(task.id, attachment)).join("")}</div>`
         : `<p class="small-empty">No attachments uploaded for this task.</p>`}
+    </section>
+  `;
+}
+
+function renderReviewPanel(task, humanReviewPacket, mergeReport) {
+  const pullRequest = task.pull_request;
+  const shouldShowPr = Boolean(pullRequest);
+  const shouldShowReport = Boolean(humanReviewPacket?.content || mergeReport?.content);
+
+  if (!shouldShowPr && !shouldShowReport && !task.human_review_reason) {
+    return "";
+  }
+
+  return `
+    <section class="detail-section">
+      <p class="detail-label">Review And Merge</p>
+      ${task.human_review_reason
+        ? `<p class="muted">Human review reason: ${escapeHtml(humanReviewReasonTitle(task.human_review_reason))}</p>`
+        : ""}
+      ${shouldShowPr
+        ? `
+          <div class="meta-grid">
+            <span><strong>PR</strong> ${pullRequest.url ? `<a class="secondary-link" href="${escapeHtml(pullRequest.url)}" target="_blank" rel="noreferrer">#${escapeHtml(String(pullRequest.number ?? "?"))}</a>` : escapeHtml(String(pullRequest.number ?? "none"))}</span>
+            <span><strong>Approval</strong> ${escapeHtml(pullRequest.review_decision ?? "UNKNOWN")}</span>
+            <span><strong>Base</strong> ${escapeHtml(pullRequest.base_branch)}</span>
+            <span><strong>Head</strong> ${escapeHtml(pullRequest.head_branch)}</span>
+            <span><strong>Head SHA</strong> ${escapeHtml(pullRequest.head_sha ?? "none")}</span>
+            <span><strong>Merged SHA</strong> ${escapeHtml(pullRequest.merged_sha ?? "none")}</span>
+          </div>
+          ${pullRequest.last_error ? `<p class="status-note">${escapeHtml(pullRequest.last_error)}</p>` : ""}
+          ${pullRequest.last_synced_at ? `<p class="muted">Last synced ${escapeHtml(formatTimestamp(pullRequest.last_synced_at))}</p>` : ""}
+        `
+        : ""}
+      ${humanReviewPacket?.content
+        ? `
+          <p class="muted">Local verification and diff summary</p>
+          <pre>${escapeHtml(humanReviewPacket.content)}</pre>
+        `
+        : ""}
+      ${mergeReport?.content
+        ? `
+          <p class="muted">Merge report</p>
+          <pre>${escapeHtml(mergeReport.content)}</pre>
+        `
+        : ""}
+    </section>
+  `;
+}
+
+function renderBudgetSection(task, summary) {
+  const limitSummary = task.budget
+    ? `
+      <div class="meta-grid">
+        <span><strong>Soft Attempts</strong>${task.budget.soft_attempts ?? "none"}</span>
+        <span><strong>Hard Attempts</strong>${task.budget.hard_attempts ?? "none"}</span>
+        <span><strong>Soft Cost</strong>${formatUsd(task.budget.soft_cost_usd)}</span>
+        <span><strong>Hard Cost</strong>${formatUsd(task.budget.hard_cost_usd)}</span>
+      </div>
+    `
+    : `<p class="small-empty">No explicit task budget. Routing currently follows role, health, and fallback policy.</p>`;
+
+  return `
+    <section class="detail-section">
+      <div class="detail-section-header">
+        <div>
+          <p class="detail-label">Budget & Routing</p>
+          <p class="muted">Attempt ledger and completion-first guardrails for this task.</p>
+        </div>
+        <div class="badge-row">
+          ${summary.soft_exceeded ? `<span class="pill warning-pill">Soft exceeded</span>` : `<span class="pill">Soft OK</span>`}
+          ${summary.hard_exceeded ? `<span class="pill danger-pill">Hard exceeded</span>` : `<span class="pill ok-pill">Hard OK</span>`}
+        </div>
+      </div>
+      ${limitSummary}
+      <div class="meta-grid">
+        <span><strong>Total Attempts</strong>${summary.total_attempts}</span>
+        <span><strong>Total Cost</strong>${formatUsd(summary.total_cost_usd)}</span>
+        <span><strong>Soft Remaining</strong>${formatRemaining(summary.soft_attempts_remaining, summary.soft_cost_remaining_usd)}</span>
+        <span><strong>Hard Remaining</strong>${formatRemaining(summary.hard_attempts_remaining, summary.hard_cost_remaining_usd)}</span>
+      </div>
+    </section>
+  `;
+}
+
+function renderCandidatePoolSection(candidatePool) {
+  return `
+    <section class="detail-section">
+      <div class="detail-section-header">
+        <div>
+          <p class="detail-label">Candidate Pool</p>
+          <p class="muted">Managed agents ranked for the next claim or fallback.</p>
+        </div>
+        <span class="pill">${candidatePool.length} candidate${candidatePool.length === 1 ? "" : "s"}</span>
+      </div>
+      ${candidatePool.length > 0
+        ? `<div class="candidate-list">${candidatePool.map(renderCandidateCard).join("")}</div>`
+        : `<p class="small-empty">No managed candidates are currently eligible for this task status.</p>`}
+    </section>
+  `;
+}
+
+function renderCandidateCard(candidate) {
+  return `
+    <article class="candidate-card ${candidate.blocked ? "is-blocked" : ""}">
+      <div class="agent-topline">
+        <strong>${escapeHtml(candidate.agent_name ?? candidate.agent_id)}</strong>
+        <div class="badge-row">
+          <span class="pill">${escapeHtml(candidate.role)}</span>
+          <span class="pill">${escapeHtml(candidate.kind)}</span>
+          ${candidate.blocked ? `<span class="pill danger-pill">blocked</span>` : `<span class="pill ok-pill">ready</span>`}
+        </div>
+      </div>
+      <p class="muted">Router score ${formatScore(candidate.score)}</p>
+      <p>${candidate.reasons.length > 0 ? candidate.reasons.map(escapeHtml).join(" · ") : "No routing notes."}</p>
+    </article>
+  `;
+}
+
+function renderAttemptsSection(attempts) {
+  return `
+    <section class="detail-section">
+      <div class="detail-section-header">
+        <div>
+          <p class="detail-label">Attempt Timeline</p>
+          <p class="muted">Token, latency, cost, and fallback chain for this task.</p>
+        </div>
+        <span class="pill">${attempts.length} run${attempts.length === 1 ? "" : "s"}</span>
+      </div>
+      ${attempts.length > 0
+        ? `<div class="run-list compact-run-list">${attempts.map((attempt) => renderRunCard(attempt, { compact: true })).join("")}</div>`
+        : `<p class="small-empty">No attempts recorded yet.</p>`}
     </section>
   `;
 }
@@ -751,7 +947,7 @@ function renderTaskActions(task) {
   const reviewButtons = task.status === "review"
     ? `
       <div class="inline-actions">
-        <button class="primary-button" data-action="approve" type="button">Approve</button>
+        <button class="primary-button" data-action="approve" type="button">Approve For Human Review</button>
         <button class="secondary-button" data-action="bounce" type="button">Bounce</button>
       </div>
     `
@@ -759,28 +955,36 @@ function renderTaskActions(task) {
   const humanButton = task.status === "human_review"
     ? `<button class="primary-button" data-action="return_to_todo" type="button">Return To To Do</button>`
     : "";
+  const mergingNote = task.status === "merging"
+    ? `<p class="muted">Merge is in progress. Actions are intentionally limited while the merger agent is working.</p>`
+    : "";
   const archiveButton = task.archived_at
     ? `<button class="primary-button" data-action="restore" type="button">Restore To Board</button>`
     : `<button class="secondary-button" data-action="archive" type="button">Archive Task</button>`;
+  const canMove = task.status !== "merging";
 
   return `
     <section class="detail-section action-section">
       <p class="detail-label">Task Actions</p>
-      <div class="move-grid">
-        <label>
-          <span>Target status</span>
-          <select id="moveTarget">
-            ${STATUS_ORDER.map(
-              (status) => `<option value="${status}" ${status === task.status ? "selected" : ""}>${STATUS_TITLES[status]}</option>`,
-            ).join("")}
-          </select>
-        </label>
-        <button class="secondary-button" data-action="move" type="button">Move</button>
-      </div>
-      <label>
-        <span>Action note</span>
-        <textarea id="taskActionNote" rows="3" placeholder="Optional context for bounce, return to queue, or manual move"></textarea>
-      </label>
+      ${canMove
+        ? `
+          <div class="move-grid">
+            <label>
+              <span>Target status</span>
+              <select id="moveTarget">
+                ${STATUS_ORDER.map(
+                  (status) => `<option value="${status}" ${status === task.status ? "selected" : ""}>${STATUS_TITLES[status]}</option>`,
+                ).join("")}
+              </select>
+            </label>
+            <button class="secondary-button" data-action="move" type="button">Move</button>
+          </div>
+          <label>
+            <span>Action note</span>
+            <textarea id="taskActionNote" rows="3" placeholder="Optional context for bounce, return to queue, or manual move"></textarea>
+          </label>
+        `
+        : mergingNote}
       ${reviewButtons}
       ${humanButton}
       <div class="inline-actions">
@@ -819,31 +1023,24 @@ function renderAgents() {
     return;
   }
 
-  agentsList.innerHTML = state.snapshot.agents
-    .map(
-      (agent) => `
-        <article class="agent-card">
-          <div class="agent-topline">
-            <strong>${escapeHtml(agent.name)}</strong>
-            <span class="pill">${escapeHtml(agent.role)}</span>
+  const roleOrder = ["planner", "executor", "reviewer", "merger"];
+  agentsList.innerHTML = roleOrder
+    .map((role) => {
+      const agents = state.snapshot.agents.filter((agent) => agent.role === role);
+      return `
+        <section class="pool-group">
+          <div class="pool-group-header">
+            <div>
+              <p class="detail-label">${escapeHtml(role)}</p>
+              <p class="muted">${agents.length} registered candidate${agents.length === 1 ? "" : "s"}.</p>
+            </div>
           </div>
-          <p>${escapeHtml(agent.kind)} · ${escapeHtml(agent.runtime_mode)} · ${escapeHtml(agent.transport)}</p>
-          <p class="muted">Last seen ${formatTimestamp(agent.last_seen_at ?? agent.registered_at)}</p>
-          <p class="muted">${agent.assigned_task_count} assigned · ${agent.pending_approval_count} pending approvals</p>
-          ${agent.cooldown_until ? `<p class="muted">Cooldown until ${formatTimestamp(agent.cooldown_until)}</p>` : ""}
-          ${agent.command ? `<p class="muted path-line">${escapeHtml(agent.command)}</p>` : ""}
-          ${agent.endpoint ? `<p class="muted path-line">${escapeHtml(agent.endpoint)}</p>` : ""}
-          <div class="inline-actions">
-            <button class="${agent.enabled ? "secondary-button" : "primary-button"}" data-agent-toggle="${agent.id}" data-enabled="${agent.enabled ? "true" : "false"}" type="button">
-              ${agent.enabled ? "Disable" : "Enable"}
-            </button>
-            <button class="ghost-button" data-agent-remove="${agent.id}" data-agent-name="${escapeHtml(agent.name)}" type="button">
-              Remove
-            </button>
-          </div>
-        </article>
-      `,
-    )
+          ${agents.length > 0
+            ? `<div class="agent-grid">${agents.map(renderAgentCard).join("")}</div>`
+            : `<p class="small-empty">No ${escapeHtml(role)} agents registered.</p>`}
+        </section>
+      `;
+    })
     .join("");
 
   agentsList.querySelectorAll("[data-agent-toggle]").forEach((button) => {
@@ -864,6 +1061,88 @@ function renderAgents() {
       void deleteAgent(agentId).catch(reportError);
     });
   });
+
+  agentsList.querySelectorAll("[data-agent-session]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const sessionId = button.dataset.agentSession;
+      if (!sessionId) return;
+      state.activeTab = "sessions";
+      state.selectedSessionId = sessionId;
+      void refreshAll({ quiet: true }).catch(reportError);
+    });
+  });
+}
+
+function renderAgentCard(agent) {
+  const capabilityPills = [
+    agent.supports_tools ? "tools" : null,
+    agent.supports_patch ? "patch" : null,
+    agent.supports_review ? "review" : null,
+  ].filter(Boolean);
+
+  return `
+    <article class="agent-card">
+      <div class="agent-topline">
+        <strong>${escapeHtml(agent.name)}</strong>
+        <div class="badge-row">
+          <span class="pill">${escapeHtml(agent.kind)}</span>
+          <span class="pill health-pill health-${escapeHtml(agent.health_state)}">${escapeHtml(agent.health_state)}</span>
+        </div>
+      </div>
+      <p>${escapeHtml(agent.provider_family)}${agent.model_id ? ` · ${escapeHtml(agent.model_id)}` : ""}</p>
+      <div class="meta-grid compact-meta-grid">
+        <span><strong>Runtime</strong>${escapeHtml(agent.runtime_mode)}</span>
+        <span><strong>Transport</strong>${escapeHtml(agent.transport)}</span>
+        <span><strong>Context</strong>${formatContextWindow(agent.context_window)}</span>
+        <span><strong>Cost Tier</strong>${escapeHtml(agent.cost_tier)}</span>
+        <span><strong>Concurrency</strong>${agent.max_concurrency}</span>
+        <span><strong>Fallback Priority</strong>${agent.fallback_priority}</span>
+      </div>
+      <div class="badge-row">
+        ${capabilityPills.length > 0
+          ? capabilityPills.map((value) => `<span class="pill">${escapeHtml(value)}</span>`).join("")
+          : `<span class="pill">no declared capabilities</span>`}
+      </div>
+      <p class="muted">Assigned ${agent.assigned_task_count} · approvals ${agent.pending_approval_count} · attempts ${agent.attempt_count}</p>
+      <p class="muted">Avg latency ${formatLatency(agent.avg_latency_ms)} · avg cost ${formatUsd(agent.avg_cost_usd)} · limit hit ${formatRate(agent.limit_hit_rate)}</p>
+      <p class="muted">Last seen ${formatTimestamp(agent.last_seen_at ?? agent.registered_at)}</p>
+      ${agent.cooldown_until ? `<p class="muted">Cooldown until ${formatTimestamp(agent.cooldown_until)}</p>` : ""}
+      ${agent.command ? `<p class="muted path-line">${escapeHtml(agent.command)}</p>` : ""}
+      ${agent.endpoint ? `<p class="muted path-line">${escapeHtml(agent.endpoint)}</p>` : ""}
+      <div class="inline-actions">
+        <button class="${agent.enabled ? "secondary-button" : "primary-button"}" data-agent-toggle="${agent.id}" data-enabled="${agent.enabled ? "true" : "false"}" type="button">
+          ${agent.enabled ? "Disable" : "Enable"}
+        </button>
+        ${agent.active_session_id ? `<button class="secondary-button" data-agent-session="${agent.active_session_id}" type="button">Open Session</button>` : ""}
+        <button class="ghost-button" data-agent-remove="${agent.id}" data-agent-name="${escapeHtml(agent.name)}" type="button">
+          Remove
+        </button>
+      </div>
+    </article>
+  `;
+}
+
+function renderRuns() {
+  if (!runsList) return;
+  const runs = state.snapshot.runs ?? [];
+  if (runs.length === 0) {
+    runsList.innerHTML = `<p class="small-empty">No attempts recorded yet.</p>`;
+    return;
+  }
+
+  runsList.innerHTML = `
+    <div class="run-summary-bar">
+      <span class="pill">${runs.length} total runs</span>
+      <span class="pill">${runs.filter((run) => run.ended_at === null).length} active</span>
+      <span class="pill">${runs.filter((run) => run.outcome === "success").length} successful</span>
+      <span class="pill">${formatUsd(runs.reduce((sum, run) => sum + Number(run.estimated_cost_usd ?? 0), 0))} tracked cost</span>
+    </div>
+    <div class="run-list">
+      ${runs.map((run) => renderRunCard(run)).join("")}
+    </div>
+  `;
+
+  bindOpenTaskButtons(runsList);
 }
 
 function renderApprovals() {
@@ -944,14 +1223,20 @@ function renderSessions() {
 }
 
 function renderSessionCard(session) {
+  const activeAttempt = session.active_attempt;
   return `
         <button class="session-card ${state.selectedSessionId === session.id ? "selected" : ""}" data-session-id="${session.id}" type="button">
           <div class="agent-topline">
             <strong>${escapeHtml(session.agent_name)}</strong>
-            <span class="pill">${escapeHtml(session.agent_role)}</span>
+            <div class="badge-row">
+              <span class="pill">${escapeHtml(session.agent_role)}</span>
+              ${activeAttempt ? `<span class="pill">${escapeHtml(activeAttempt.provider)}${activeAttempt.model ? ` · ${escapeHtml(activeAttempt.model)}` : ""}</span>` : ""}
+            </div>
           </div>
           <p>${escapeHtml(session.agent_kind)} · ${escapeHtml(session.status)}${session.task_title ? ` · ${escapeHtml(session.task_title)}` : ""}</p>
           ${session.command ? `<p class="muted path-line">${escapeHtml(session.command)}</p>` : ""}
+          ${activeAttempt ? `<p class="muted">Attempt #${activeAttempt.attempt_number} · ${formatOutcome(activeAttempt.outcome)} · ${formatLatency(activeAttempt.latency_ms)}</p>` : ""}
+          ${session.budget_summary ? `<p class="muted">${formatBudgetHeadline(session.budget_summary)}</p>` : ""}
           <p class="muted">${session.pending_approval_count} pending approvals · last seen ${formatTimestamp(session.last_seen_at ?? session.started_at)}</p>
           ${session.last_error ? `<p class="muted">${escapeHtml(session.last_error)}</p>` : ""}
         </button>
@@ -972,6 +1257,7 @@ function renderSessionDetail() {
   const { session, approvals, messages, log_content } = state.sessionDetail;
   const terminalTranscript = buildTerminalTranscript(session, messages, approvals, log_content);
   const canDeleteSession = !["busy", "waiting", "starting"].includes(session.status);
+  const canFallback = Boolean(session.task_id);
   const terminalBuffer = state.terminalBuffers[session.id] ?? "";
   sessionDetail.className = "task-detail";
   sessionDetail.innerHTML = `
@@ -993,9 +1279,41 @@ function renderSessionDetail() {
         <span><strong>Started</strong>${formatTimestamp(session.started_at)}</span>
         <span><strong>Last Seen</strong>${formatTimestamp(session.last_seen_at ?? session.started_at)}</span>
       </div>
+      ${session.active_attempt
+        ? `
+          <div class="session-info-card">
+            <div class="agent-topline">
+              <strong>Active Attempt #${session.active_attempt.attempt_number}</strong>
+              <div class="badge-row">
+                <span class="pill">${escapeHtml(session.active_attempt.role)}</span>
+                <span class="pill">${escapeHtml(session.active_attempt.provider)}${session.active_attempt.model ? ` · ${escapeHtml(session.active_attempt.model)}` : ""}</span>
+              </div>
+            </div>
+            <p class="muted">Started ${formatTimestamp(session.active_attempt.started_at)} · ${formatLatency(session.active_attempt.latency_ms)} · ${formatTokens(session.active_attempt.prompt_tokens, session.active_attempt.completion_tokens)}</p>
+          </div>
+        `
+        : `<p class="small-empty">No active attempt ledger is attached to this session.</p>`}
+      ${session.budget_summary
+        ? `
+          <div class="session-info-card">
+            <div class="agent-topline">
+              <strong>Budget Summary</strong>
+              <div class="badge-row">
+                ${session.budget_summary.soft_exceeded ? `<span class="pill warning-pill">soft exceeded</span>` : `<span class="pill">soft ok</span>`}
+                ${session.budget_summary.hard_exceeded ? `<span class="pill danger-pill">hard exceeded</span>` : `<span class="pill ok-pill">hard ok</span>`}
+              </div>
+            </div>
+            <p class="muted">${formatBudgetHeadline(session.budget_summary)}</p>
+          </div>
+        `
+        : ""}
       ${session.command ? `<p class="path-line terminal-command-line">$ ${escapeHtml(session.command)}</p>` : `<p class="small-empty">No managed start command configured for this session.</p>`}
       ${session.last_error ? `<p class="terminal-warning">${escapeHtml(session.last_error)}</p>` : ""}
       <div class="inline-actions">
+        ${session.task_id ? `<button class="secondary-button" data-open-task="${session.task_id}" type="button">Open Task</button>` : ""}
+        <button class="secondary-button" data-session-fallback="${session.id}" type="button" ${canFallback ? "" : "disabled"}>
+          Fallback Now
+        </button>
         <button class="ghost-button" data-delete-session="${session.id}" type="button" ${canDeleteSession ? "" : "disabled"}>
           Remove Session
         </button>
@@ -1143,9 +1461,16 @@ function renderSessionDetail() {
     void deleteSession(session.id).catch(reportError);
   });
 
+  sessionDetail.querySelector("[data-session-fallback]")?.addEventListener("click", () => {
+    if (!canFallback) return;
+    void fallbackSession(session.id).catch(reportError);
+  });
+
   sessionDetail.querySelector("#terminalThemeSelect")?.addEventListener("change", (event) => {
     setTerminalTheme(event.target.value);
   });
+
+  bindOpenTaskButtons(sessionDetail);
 }
 
 async function moveTask(taskId, targetStatus, note = "") {
@@ -1259,6 +1584,16 @@ async function interruptSession(sessionId) {
   });
   state.selectedSessionId = sessionId;
   state.terminalBuffers[sessionId] = "";
+  await refreshAll({ quiet: true });
+}
+
+async function fallbackSession(sessionId) {
+  await fetchJson(`/api/sessions/${sessionId}/fallback`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  state.selectedSessionId = sessionId;
+  showToast("Fallback requested for the active session", { kind: "ok" });
   await refreshAll({ quiet: true });
 }
 
@@ -1386,6 +1721,143 @@ function priorityTitle(priorityLabel) {
   return PRIORITY_TITLES[priorityLabel] ?? String(priorityLabel ?? "Unknown");
 }
 
+function renderRunCard(run, options = {}) {
+  const compact = Boolean(options.compact);
+  const statusClass = run.outcome ? `outcome-${run.outcome}` : "outcome-active";
+  return `
+    <article class="run-card ${compact ? "compact" : ""}">
+      <div class="agent-topline">
+        <div>
+          <strong>${run.task_title ? escapeHtml(run.task_title) : `Task ${escapeHtml(run.task_id)}`}</strong>
+          <p class="muted">Attempt #${run.attempt_number} · ${escapeHtml(run.role)} · ${escapeHtml(run.agent_name ?? run.agent_id)}</p>
+        </div>
+        <div class="badge-row">
+          <span class="pill">${escapeHtml(run.provider)}${run.model ? ` · ${escapeHtml(run.model)}` : ""}</span>
+          <span class="pill ${statusClass}">${escapeHtml(formatOutcome(run.outcome))}</span>
+        </div>
+      </div>
+      <div class="meta-grid compact-meta-grid">
+        <span><strong>Started</strong>${formatTimestamp(run.started_at)}</span>
+        <span><strong>Ended</strong>${run.ended_at ? formatTimestamp(run.ended_at) : "active"}</span>
+        <span><strong>Latency</strong>${formatLatency(run.latency_ms)}</span>
+        <span><strong>Tokens</strong>${formatTokens(run.prompt_tokens, run.completion_tokens)}</span>
+        <span><strong>Cost</strong>${formatUsd(run.estimated_cost_usd)}</span>
+        <span><strong>Handoff</strong>${run.handoff_reason ? escapeHtml(run.handoff_reason) : "none"}</span>
+      </div>
+      ${compact
+        ? ""
+        : `
+          <div class="inline-actions">
+            <button class="secondary-button" data-open-task="${run.task_id}" type="button">Open Task</button>
+          </div>
+        `}
+    </article>
+  `;
+}
+
+function bindOpenTaskButtons(root) {
+  root.querySelectorAll("[data-open-task]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const taskId = button.dataset.openTask;
+      if (!taskId) return;
+      void openTask(taskId).catch(reportError);
+    });
+  });
+}
+
+async function openTask(taskId) {
+  state.activeTab = "board";
+  state.selectedTaskId = taskId;
+  await refreshSelectedTaskDetail();
+  render();
+}
+
+function parseOptionalNumber(value) {
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim();
+  if (!normalized) return undefined;
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseOptionalInteger(value) {
+  const parsed = parseOptionalNumber(value);
+  if (parsed === undefined) return undefined;
+  return Number.isInteger(parsed) ? parsed : undefined;
+}
+
+function compactObject(object) {
+  return Object.fromEntries(
+    Object.entries(object).filter(([, value]) =>
+      value !== undefined &&
+      value !== null &&
+      value !== ""
+    ),
+  );
+}
+
+function formatUsd(value) {
+  if (value === undefined || value === null || !Number.isFinite(Number(value))) return "none";
+  const numeric = Number(value);
+  if (numeric === 0) return "$0.00";
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: numeric < 1 ? 3 : 2,
+  }).format(numeric);
+}
+
+function formatLatency(value) {
+  if (!Number.isFinite(value) || value === null) return "n/a";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} s`;
+}
+
+function formatTokens(promptTokens, completionTokens) {
+  const parts = [];
+  if (Number.isFinite(promptTokens)) parts.push(`p ${Number(promptTokens).toLocaleString()}`);
+  if (Number.isFinite(completionTokens)) parts.push(`c ${Number(completionTokens).toLocaleString()}`);
+  return parts.length > 0 ? parts.join(" · ") : "n/a";
+}
+
+function formatRate(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function formatScore(value) {
+  if (!Number.isFinite(value)) return "0";
+  return Number(value).toFixed(Math.abs(value) >= 10 ? 1 : 2);
+}
+
+function formatOutcome(value) {
+  if (!value) return "active";
+  return value.replaceAll("_", " ");
+}
+
+function formatContextWindow(value) {
+  if (!Number.isFinite(value) || value === null) return "auto";
+  if (value >= 1000) {
+    return `${Math.round(Number(value) / 1000)}k`;
+  }
+  return String(value);
+}
+
+function formatRemaining(attemptsRemaining, costRemaining) {
+  const parts = [];
+  if (attemptsRemaining !== null && attemptsRemaining !== undefined) {
+    parts.push(`${attemptsRemaining} attempts`);
+  }
+  if (costRemaining !== null && costRemaining !== undefined) {
+    parts.push(formatUsd(costRemaining));
+  }
+  return parts.length > 0 ? parts.join(" · ") : "unbounded";
+}
+
+function formatBudgetHeadline(summary) {
+  return `${summary.total_attempts} attempts · ${formatUsd(summary.total_cost_usd)} total · soft ${summary.soft_exceeded ? "exceeded" : "ok"} · hard ${summary.hard_exceeded ? "exceeded" : "ok"}`;
+}
+
 function buildTerminalTranscript(session, messages, approvals, logContent) {
   const lines = [
     "DeltaPilot managed session",
@@ -1480,6 +1952,10 @@ function splitLines(value) {
 
 function statusTitle(value) {
   return STATUS_TITLES[value] ?? value;
+}
+
+function humanReviewReasonTitle(value) {
+  return HUMAN_REVIEW_REASON_TITLES[value] ?? value;
 }
 
 function formatTimestamp(value) {

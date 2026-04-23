@@ -88,16 +88,26 @@ const agent = await orch.registerAgent({
 console.log(agent.id); // pass as --agent-id
 ```
 
-The server exposes exactly 5 tools. None of them take `agent_id`; the id is
+The server exposes 8 tools. None of them take `agent_id`; the id is
 the spawn binding.
 
 | Tool              | Input                                           | Output                              |
 | ----------------- | ----------------------------------------------- | ----------------------------------- |
+| `create_task`     | `{ title, brief?, priority?, acceptance? }`     | new `Task` row                      |
 | `claim_task`      | —                                               | `Task` row, or `null` if queue empty |
 | `heartbeat`       | `{ task_id }`                                   | `"ok"`                              |
+| `publish_plan`    | `{ task_id, plan }`                             | updated `Task` row                  |
 | `submit_work`     | `{ task_id, commit_sha? }`                      | updated `Task` row                  |
+| `submit_review`   | `{ task_id, decision, note? }`                  | updated `Task` row                  |
 | `report_limit`    | `{ task_id, reason: "rate_limit" \| "context_limit" \| "crash" }` | `Handoff` row |
 | `request_handoff` | `{ task_id, reason }`                           | `Handoff` row (same behavior as `report_limit`) |
+
+Important v1 constraint:
+
+- `submit_review` with `decision: "bounce"` is supported for external reviewer agents.
+- `submit_review` with `decision: "approve"` is intentionally rejected over MCP and the SDK wrapper.
+- Approval is a managed flow because DeltaPilot must push the branch, create or refresh a GitHub PR to `main`, generate the English human-review packet, and preserve the worktree before entering `human_review`.
+- The `merger` role is managed-runner only in v1. There is no external MCP merge tool flow.
 
 ---
 
@@ -131,6 +141,10 @@ CLI:
    `<repo>/.deltapilot/workspaces/<task_id>/`.
 3. Do trivial edits, commit to the task branch, invoke `submit_work`.
    Task should land at status `review`.
+4. A reviewer agent may use `submit_review` with `decision: "bounce"` to send
+   the task back for more work.
+5. Approval to `human_review` and the final merge to `main` happen through the
+   managed dashboard/runner flow, not through public MCP tools.
 
 **⚠️ No auto-handoff on path A.** Claude Code has no knowledge of DeltaPilot's
 `withAutoHandoff` helper. If Claude Code hits a rate limit during a task, it
@@ -185,7 +199,7 @@ try {
 
 When the wrapped function throws and `isLimit` returns a reason,
 `withAutoHandoff` calls `client.reportLimit` *before* rethrowing, so the
-orchestrator has already moved the task to `handoff_pending` and snapshotted
+orchestrator has already requeued the task in the same phase and snapshotted
 artifacts by the time your caller sees the error.
 
 This path has a subprocess integration test

@@ -1,6 +1,9 @@
 import type { Agent, AgentRole, ApprovalRequestKind, Task } from "@deltapilot/shared";
 import type { Orchestrator } from "@deltapilot/core";
 import { createCodexAdapter } from "./adapters/codex.js";
+import { createClaudeAdapter } from "./adapters/claude-code.js";
+import { createOpenClawAdapter } from "./adapters/openclaw.js";
+import { createOllamaAdapter } from "./adapters/ollama.js";
 
 export interface AdapterContext {
   task: Task;
@@ -15,7 +18,7 @@ export interface AdapterContext {
 }
 
 export interface AdapterResult {
-  kind: "ok" | "error" | "rate_limit" | "context_limit" | "approval" | "question";
+  kind: "ok" | "error" | "rate_limit" | "context_limit" | "budget_exceeded" | "approval" | "question";
   message?: string;
   output?: string;
   decision?: "approve" | "bounce";
@@ -34,6 +37,10 @@ type Factory = () => AgentAdapter;
 const registry = new Map<string, Factory>();
 const builtinRegistry = new Map<string, Factory>([
   ["codex", createCodexAdapter],
+  ["claude-code", createClaudeAdapter],
+  ["claude-sdk", createClaudeAdapter],
+  ["openclaw", createOpenClawAdapter],
+  ["ollama", createOllamaAdapter],
 ]);
 
 export function registerAdapter(kind: string, factory: Factory): void {

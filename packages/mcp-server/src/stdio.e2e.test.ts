@@ -166,8 +166,11 @@ describe("deltapilot-mcp stdio CLI — e2e", () => {
         "claim_task",
         "create_task",
         "heartbeat",
+        "publish_checkpoint",
         "publish_plan",
         "report_limit",
+        "report_usage",
+        "request_approval",
         "request_handoff",
         "submit_review",
         "submit_work",
@@ -256,7 +259,61 @@ describe("deltapilot-mcp stdio CLI — e2e", () => {
     }
   }, 20_000);
 
-  it("reviewer claim_task -> submit_review approve drives the task to done", async () => {
+  it("executor can publish checkpoints, report usage, and request approval over MCP", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const executorId = await registerAgent(repoRoot, dbPath, "executor");
+    const taskId = await createPlannableTask(repoRoot, dbPath);
+    await promoteTaskToExecution(repoRoot, dbPath, plannerId, taskId);
+
+    const { client } = await connectClient(repoRoot, executorId);
+    try {
+      await client.callTool({ name: "claim_task", arguments: {} });
+
+      const checkpointResult = await client.callTool({
+        name: "publish_checkpoint",
+        arguments: {
+          task_id: taskId,
+          summary: "Implemented the first slice.",
+          files_touched: ["src/example.ts"],
+          next_steps: ["Run reviewer checks"],
+        },
+      });
+      const checkpoint = parseJson<{ checkpoint_artifact_id: string | null }>(checkpointResult);
+      expect(checkpoint.checkpoint_artifact_id).toBeTruthy();
+
+      const usageResult = await client.callTool({
+        name: "report_usage",
+        arguments: {
+          task_id: taskId,
+          provider: "openai",
+          model: "gpt-5.4",
+          prompt_tokens: 1200,
+          completion_tokens: 300,
+          estimated_cost_usd: 0.42,
+          latency_ms: 9100,
+        },
+      });
+      const usage = parseJson<{ prompt_tokens: number | null; estimated_cost_usd: number | null }>(usageResult);
+      expect(usage.prompt_tokens).toBe(1200);
+      expect(usage.estimated_cost_usd).toBe(0.42);
+
+      const approvalResult = await client.callTool({
+        name: "request_approval",
+        arguments: {
+          task_id: taskId,
+          title: "Need human confirmation",
+          body: "Please confirm the fallback path.",
+        },
+      });
+      const approval = parseJson<{ task_id: string | null; status: string }>(approvalResult);
+      expect(approval.task_id).toBe(taskId);
+      expect(approval.status).toBe("pending");
+    } finally {
+      await client.close();
+    }
+  }, 20_000);
+
+  it("reviewer claim_task -> submit_review approve is rejected because PR publication is managed", async () => {
     const plannerId = await registerAgent(repoRoot, dbPath, "planner");
     const executorId = await registerAgent(repoRoot, dbPath, "executor");
     const reviewerId = await registerAgent(repoRoot, dbPath, "reviewer");
@@ -276,8 +333,19 @@ describe("deltapilot-mcp stdio CLI — e2e", () => {
         name: "submit_review",
         arguments: { task_id: taskId, decision: "approve", note: "Looks good" },
       });
-      const reviewed = parseJson<{ status: string }>(reviewResult);
-      expect(reviewed.status).toBe("done");
+      const reviewText = (reviewResult as { content?: Array<{ type: string; text: string }> }).content?.[0]?.text ?? "";
+      expect(reviewText).toContain("submit_review approve is not supported over MCP in v1");
+
+      const conn = openDatabase(dbPath);
+      try {
+        const row = conn.raw
+          .prepare("SELECT status, assigned_agent_id FROM tasks WHERE id = ?")
+          .get(taskId) as { status: string; assigned_agent_id: string | null };
+        expect(row.status).toBe("review");
+        expect(row.assigned_agent_id).toBe(reviewerId);
+      } finally {
+        conn.close();
+      }
     } finally {
       await client.close();
     }
