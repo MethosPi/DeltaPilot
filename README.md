@@ -20,6 +20,25 @@ To inspect a live repo with the dashboard:
 pnpm dashboard -- --repo /abs/path/to/target/repo --host 0.0.0.0 --port 3000
 ```
 
+Before registering agents against a target repo, start the dashboard or MCP
+server once so DeltaPilot creates `<repo>/.deltapilot-data.db` and applies
+migrations.
+
+From the DeltaPilot repo root, the supported operator flow is:
+
+```bash
+pnpm agent:register -- --name codex-executor --kind codex --repo /abs/path/to/target/repo
+```
+
+`--role` defaults to `executor`. Use `planner` or `reviewer` when needed.
+
+If you need to bypass the package-manager wrapper, the direct script form still
+works:
+
+```bash
+node scripts/register-agent.mjs --name codex-executor --kind codex --repo /abs/path/to/target/repo
+```
+
 For Docker-based deployment:
 
 ```bash

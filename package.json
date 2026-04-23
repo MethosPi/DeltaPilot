@@ -24,7 +24,8 @@
     "demo": "pnpm build && node ./scripts/demo.ts",
     "agent:register": "node ./scripts/register-agent.mjs",
     "docker:build": "docker build -t deltapilot:local .",
-    "test": "turbo run test",
+    "test": "turbo run test && node --test ./scripts/register-agent.test.mjs",
+    "test:register-agent": "node --test ./scripts/register-agent.test.mjs",
     "typecheck": "turbo run typecheck && tsc -p tsconfig.scripts.json --noEmit",
     "lint": "turbo run lint"
   },

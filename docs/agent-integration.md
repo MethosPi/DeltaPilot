@@ -40,6 +40,10 @@ If you also want the board UI against the same repo and DB, run:
 pnpm dashboard -- --repo /abs/path/to/your/target/repo --host 0.0.0.0 --port 3000
 ```
 
+Before registering an agent against a target repo, make sure that repo's DB
+exists. Starting the dashboard or MCP server once against `--repo` creates
+`<repo>/.deltapilot-data.db` and applies migrations.
+
 Every agent is **spawn-bound to one `agent_id`** via CLI flag or env:
 
 ```bash
@@ -48,7 +52,23 @@ deltapilot-mcp --repo /path/to/repo --agent-id <uuid>
 DP_REPO=/path/to/repo DP_AGENT_ID=<uuid> deltapilot-mcp
 ```
 
-Register an agent first (from an orchestrator script) to get a UUID:
+From the DeltaPilot repo root, the documented operator registration flow is:
+
+```bash
+pnpm agent:register -- --name claude-code-1 --kind claude-code --repo /path/to/repo
+```
+
+`--role` defaults to `executor`; `--runtime-mode` defaults to `external`; and
+`--transport` defaults to `mcp-stdio`.
+
+If you need to bypass the package-manager wrapper, the direct script form is:
+
+```bash
+node scripts/register-agent.mjs --name claude-code-1 --kind claude-code --repo /path/to/repo
+```
+
+You can also register an agent from an orchestrator script and pass the
+returned UUID as `--agent-id`:
 
 ```ts
 import { Orchestrator, WorktreeManager, openDatabase } from "@deltapilot/core";
