@@ -1,5 +1,6 @@
 import { execa } from "execa";
 import { existsSync } from "node:fs";
+import { lstat, mkdir, readlink, symlink } from "node:fs/promises";
 import path from "node:path";
 
 export interface WorktreeManagerOptions {
@@ -32,6 +33,14 @@ export class WorktreeManager {
     return path.join(this.workspacesDir, taskId);
   }
 
+  attachmentDir(taskId: string): string {
+    return path.join(this.repoRoot, ".deltapilot", "attachments", taskId);
+  }
+
+  attachmentMountPath(taskId: string): string {
+    return path.join(this.pathFor(taskId), ".deltapilot", "attachments");
+  }
+
   branchFor(taskId: string): string {
     return `deltapilot/task/${taskId}`;
   }
@@ -50,6 +59,8 @@ export class WorktreeManager {
       { cwd: this.repoRoot },
     );
 
+    await this.ensureAttachmentAccess(taskId);
+
     return { taskId, branchName, worktreePath };
   }
 
@@ -66,6 +77,7 @@ export class WorktreeManager {
     }
 
     await execa("git", ["worktree", "add", worktreePath, branchName], { cwd: this.repoRoot });
+    await this.ensureAttachmentAccess(taskId);
     return { taskId, branchName, worktreePath };
   }
 
@@ -90,5 +102,34 @@ export class WorktreeManager {
       cwd: this.pathFor(taskId),
     });
     return stdout.trim();
+  }
+
+  async ensureAttachmentAccess(taskId: string): Promise<string> {
+    const targetDir = this.attachmentDir(taskId);
+    await mkdir(targetDir, { recursive: true });
+
+    const worktreePath = this.pathFor(taskId);
+    if (!existsSync(worktreePath)) {
+      return targetDir;
+    }
+
+    const mountPath = this.attachmentMountPath(taskId);
+    await mkdir(path.dirname(mountPath), { recursive: true });
+
+    if (existsSync(mountPath)) {
+      const stats = await lstat(mountPath);
+      if (stats.isSymbolicLink()) {
+        const currentTarget = await readlink(mountPath);
+        const resolvedTarget = path.resolve(path.dirname(mountPath), currentTarget);
+        if (resolvedTarget === targetDir) {
+          return mountPath;
+        }
+      }
+
+      throw new Error(`attachment mount already exists at ${mountPath}`);
+    }
+
+    await symlink(targetDir, mountPath, "dir");
+    return mountPath;
   }
 }

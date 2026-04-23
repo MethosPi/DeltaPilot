@@ -205,12 +205,18 @@ async function buildPrompt(ctx: AdapterContext): Promise<string> {
 
 function formatAcceptance(acceptance: AdapterContext["task"]["acceptance"]): string {
   if (!acceptance) return "Acceptance criteria: none provided.";
-  return [
-    `Acceptance goal: ${acceptance.goal}`,
-    `Deliverables:\n${acceptance.deliverables.map((item) => `- ${item}`).join("\n")}`,
-    `Files in scope:\n${acceptance.files_in_scope.map((item) => `- ${item}`).join("\n")}`,
-    `Success test: ${acceptance.success_test}`,
-  ].join("\n");
+  const parts = [
+    acceptance.goal ? `Acceptance goal: ${acceptance.goal}` : null,
+    acceptance.deliverables.length > 0
+      ? `Deliverables:\n${acceptance.deliverables.map((item) => `- ${item}`).join("\n")}`
+      : null,
+    acceptance.files_in_scope.length > 0
+      ? `Files in scope:\n${acceptance.files_in_scope.map((item) => `- ${item}`).join("\n")}`
+      : null,
+    acceptance.success_test ? `Success test: ${acceptance.success_test}` : null,
+  ].filter((value): value is string => Boolean(value));
+
+  return parts.length > 0 ? parts.join("\n") : "Acceptance criteria: none provided.";
 }
 
 function classifyFailure(message: string): AdapterResult["kind"] {

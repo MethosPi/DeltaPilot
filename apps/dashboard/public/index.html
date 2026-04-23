@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DeltaPipeline</title>
+    <title>DeltaPilot</title>
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
     <link rel="stylesheet" href="/styles.css" />
@@ -12,7 +12,7 @@
     <div class="page-shell">
       <header class="hero">
         <div>
-          <h1 class="matrix-title">DeltaPipeline</h1>
+          <h1 class="matrix-title">DeltaPilot</h1>
         </div>
         <div class="hero-actions">
           <div class="poll-indicator">
@@ -49,25 +49,28 @@
                   <textarea name="brief" rows="4"></textarea>
                 </label>
                 <label>
-                  <span>Priority (0-100)</span>
-                  <input name="priority" type="number" min="0" max="100" value="50" />
-                </label>
-                <label>
-                  <span>Acceptance Goal</span>
-                  <input name="goal" type="text" placeholder="Optional" />
+                  <span>Priority</span>
+                  <select name="priority">
+                    <option value="max">Max</option>
+                    <option value="high">High</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="low">Low</option>
+                  </select>
                 </label>
                 <label>
                   <span>Deliverables</span>
                   <textarea name="deliverables" rows="3" placeholder="One per line"></textarea>
                 </label>
                 <label>
-                  <span>Files In Scope</span>
-                  <textarea name="files_in_scope" rows="3" placeholder="One per line"></textarea>
+                  <span>Attachments</span>
+                  <input
+                    name="attachments"
+                    type="file"
+                    multiple
+                    accept="image/*,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.yaml,.yml,.log,.doc,.docx,.rtf,.odt,.pdf,video/*,audio/*"
+                  />
                 </label>
-                <label>
-                  <span>Success Test</span>
-                  <input name="success_test" type="text" placeholder="Optional" />
-                </label>
+                <p class="field-hint">Images, text, docs, PDFs, video, and audio are supported. Max 25 MB per file.</p>
                 <button class="primary-button" type="submit">Create Task</button>
               </form>
             </section>
@@ -84,11 +87,14 @@
           <section class="board-panel panel">
             <div class="panel-header">
               <div>
-                <p class="panel-kicker">Board</p>
+                <p id="boardKicker" class="panel-kicker">Board</p>
+                <h2 id="boardTitle">Active board</h2>
               </div>
-              <div class="meta-badges">
-                <span id="repoMeta" class="meta-badge"></span>
-                <span id="dbMeta" class="meta-badge"></span>
+              <div class="board-header-controls">
+                <div class="board-toolbar">
+                  <div id="boardViewTabs" class="board-view-tabs"></div>
+                  <div id="boardActions" class="board-toolbar-actions"></div>
+                </div>
               </div>
             </div>
             <div id="board" class="board"></div>

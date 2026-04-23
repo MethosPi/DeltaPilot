@@ -19,7 +19,7 @@
   },
   "scripts": {
     "build": "turbo run build",
-    "dashboard": "pnpm --filter @deltapilot/dashboard build && node ./apps/dashboard/dist/cli.js",
+    "dashboard": "pnpm exec turbo run build --filter=@deltapilot/dashboard && node ./apps/dashboard/dist/cli.js",
     "runner": "pnpm --filter @deltapilot/runner build && node ./apps/runner/dist/cli.js",
     "demo": "pnpm build && node ./scripts/demo.ts",
     "agent:register": "node ./scripts/register-agent.mjs",

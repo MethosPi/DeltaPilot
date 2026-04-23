@@ -15,11 +15,14 @@ import {
   artifactKindSchema,
   handoffReasonSchema,
   handoffSchema,
+  normalizeAcceptanceCriteria,
+  normalizeTaskPriorityRank,
   nextStatus,
   reviewDecisionSchema,
   sessionMessageDirectionSchema,
   sessionMessageSchema,
   sessionStatusSchema,
+  taskPriorityRankFromLabel,
   taskStatusSchema,
 } from "@deltapilot/shared";
 import type {
@@ -41,6 +44,7 @@ import type {
   SessionStatus,
   Task,
   TaskEvent,
+  TaskPriorityLabel,
   TaskStatus,
 } from "@deltapilot/shared";
 import type { DrizzleDb } from "./db/client.js";
@@ -82,7 +86,7 @@ export interface UpdateAgentInput {
 export interface CreateTaskInput {
   title: string;
   brief?: string;
-  priority?: number;
+  priority?: number | TaskPriorityLabel;
   acceptance?: AcceptanceCriteria;
 }
 
@@ -387,6 +391,10 @@ export class Orchestrator {
   async createTask(input: CreateTaskInput): Promise<Task> {
     const id = this.uuid();
     const ts = this.now().toISOString();
+    const priority =
+      typeof input.priority === "string"
+        ? taskPriorityRankFromLabel(input.priority)
+        : normalizeTaskPriorityRank(input.priority ?? 50);
     const acceptanceJson = input.acceptance
       ? JSON.stringify(acceptanceCriteriaSchema.parse(input.acceptance))
       : null;
@@ -399,7 +407,7 @@ export class Orchestrator {
           claimed_at, last_heartbeat_at)
          VALUES (?, ?, ?, 'todo', ?, NULL, NULL, NULL, ?, 0, NULL, NULL, ?, ?, NULL, NULL)`,
       )
-      .run(id, input.title, input.brief ?? "", input.priority ?? 50, acceptanceJson, ts, ts);
+      .run(id, input.title, input.brief ?? "", priority, acceptanceJson, ts, ts);
 
     this.recordEvent({
       taskId: id,
@@ -1319,10 +1327,14 @@ function claimEventKindFor(role: AgentRole): TaskEvent["kind"] {
 }
 
 function rowToTask(row: TaskRow): Task {
-  const acceptance =
-    row.acceptance_json !== null
-      ? acceptanceCriteriaSchema.parse(JSON.parse(row.acceptance_json))
-      : null;
+  let acceptance: AcceptanceCriteria | null = null;
+  if (row.acceptance_json !== null) {
+    try {
+      acceptance = normalizeAcceptanceCriteria(JSON.parse(row.acceptance_json));
+    } catch {
+      acceptance = null;
+    }
+  }
   return {
     id: row.id,
     title: row.title,

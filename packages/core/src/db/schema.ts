@@ -35,10 +35,16 @@ export const tasks = sqliteTable(
     updatedAt: text("updated_at").notNull(),
     claimedAt: text("claimed_at"),
     lastHeartbeatAt: text("last_heartbeat_at"),
+    archivedAt: text("archived_at"),
   },
   (t) => ({
     statusIdx: index("tasks_status_idx").on(t.status),
     statusPriorityIdx: index("tasks_status_priority_idx").on(t.status, t.priority),
+    archivedStatusPriorityIdx: index("tasks_archived_status_priority_idx").on(
+      t.archivedAt,
+      t.status,
+      t.priority,
+    ),
   }),
 );
 
@@ -75,6 +81,25 @@ export const artifacts = sqliteTable(
   },
   (t) => ({
     taskIdx: index("artifacts_task_idx").on(t.taskId),
+  }),
+);
+
+export const taskAttachments = sqliteTable(
+  "task_attachments",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    originalName: text("original_name").notNull(),
+    storedPath: text("stored_path").notNull(),
+    mimeType: text("mime_type").notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    category: text("category").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (t) => ({
+    taskIdx: index("task_attachments_task_idx").on(t.taskId),
   }),
 );
 

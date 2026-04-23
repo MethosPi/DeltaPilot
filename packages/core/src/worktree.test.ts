@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execa } from "execa";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readlink, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,6 +62,21 @@ describe("WorktreeManager", () => {
 
     const resumedHead = await mgr.currentHead("task-2");
     expect(resumedHead).toBe(originalHead);
+  });
+
+  it("mounts the shared attachment directory inside a task worktree", async () => {
+    const { worktreePath } = await mgr.createWorktree("task-attachments");
+    const mountPath = mgr.attachmentMountPath("task-attachments");
+    const targetPath = mgr.attachmentDir("task-attachments");
+
+    expect(existsSync(targetPath)).toBe(true);
+
+    const stats = await lstat(mountPath);
+    expect(stats.isSymbolicLink()).toBe(true);
+
+    const target = await readlink(mountPath);
+    expect(path.resolve(path.dirname(mountPath), target)).toBe(targetPath);
+    expect(mountPath.startsWith(worktreePath)).toBe(true);
   });
 
   it("rejects creating a worktree that already exists", async () => {

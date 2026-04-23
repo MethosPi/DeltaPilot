@@ -48,12 +48,19 @@ describe("dashboard server — e2e", () => {
       body: JSON.stringify({
         title: "dashboard task",
         brief: "created through HTTP",
-        priority: 82,
+        priority: "high",
+        acceptance: {
+          deliverables: ["task.md"],
+        },
       }),
     });
     expect(createRes.status).toBe(201);
-    const created = (await createRes.json()) as { task: { id: string; status: string } };
+    const created = (await createRes.json()) as {
+      task: { id: string; status: string; priority_label: string; acceptance: { deliverables: string[] } | null };
+    };
     expect(created.task.status).toBe("todo");
+    expect(created.task.priority_label).toBe("high");
+    expect(created.task.acceptance?.deliverables).toEqual(["task.md"]);
 
     const snapshotRes = await fetch(`${server.origin}/api/dashboard`);
     expect(snapshotRes.status).toBe(200);
@@ -76,9 +83,97 @@ describe("dashboard server — e2e", () => {
           id: created.task.id,
           title: "dashboard task",
           status: "todo",
+          priority_label: "high",
         }),
       ]),
     );
+  });
+
+  it("archives, restores, and bulk-archives board tasks", async () => {
+    const createTask = async (title: string) => {
+      const response = await fetch(`${server.origin}/api/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      expect(response.status).toBe(201);
+      return (await response.json()) as { task: { id: string; archived_at: string | null } };
+    };
+
+    const first = await createTask("archive me");
+    const second = await createTask("archive me too");
+
+    const archiveRes = await fetch(`${server.origin}/api/tasks/${first.task.id}/actions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "archive" }),
+    });
+    expect(archiveRes.status).toBe(200);
+    const archived = (await archiveRes.json()) as { task: { archived_at: string | null } };
+    expect(archived.task.archived_at).toEqual(expect.any(String));
+
+    const restoreRes = await fetch(`${server.origin}/api/tasks/${first.task.id}/actions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "restore" }),
+    });
+    expect(restoreRes.status).toBe(200);
+    const restored = (await restoreRes.json()) as { task: { archived_at: string | null } };
+    expect(restored.task.archived_at).toBeNull();
+
+    const clearRes = await fetch(`${server.origin}/api/tasks/archive-all`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(clearRes.status).toBe(200);
+    const cleared = (await clearRes.json()) as { archived_count: number };
+    expect(cleared.archived_count).toBe(2);
+
+    const snapshotRes = await fetch(`${server.origin}/api/dashboard`);
+    expect(snapshotRes.status).toBe(200);
+    const snapshot = (await snapshotRes.json()) as {
+      tasks: Array<{ id: string; archived_at: string | null }>;
+    };
+    expect(snapshot.tasks.find((task) => task.id === first.task.id)?.archived_at).toEqual(expect.any(String));
+    expect(snapshot.tasks.find((task) => task.id === second.task.id)?.archived_at).toEqual(expect.any(String));
+  });
+
+  it("uploads task attachments and exposes previews in task detail", async () => {
+    const createRes = await fetch(`${server.origin}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "attachment task",
+        brief: "needs source files",
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()) as { task: { id: string } };
+
+    const form = new FormData();
+    form.append("files", new Blob(["hello from attachment"], { type: "text/plain" }), "notes.txt");
+
+    const uploadRes = await fetch(`${server.origin}/api/tasks/${created.task.id}/attachments`, {
+      method: "POST",
+      body: form,
+    });
+    expect(uploadRes.status).toBe(201);
+    const uploaded = (await uploadRes.json()) as {
+      attachments: Array<{ id: string; original_name: string; category: string }>;
+    };
+    expect(uploaded.attachments).toHaveLength(1);
+    expect(uploaded.attachments[0]?.original_name).toBe("notes.txt");
+    expect(uploaded.attachments[0]?.category).toBe("text");
+
+    const detailRes = await fetch(`${server.origin}/api/tasks/${created.task.id}`);
+    expect(detailRes.status).toBe(200);
+    const detail = (await detailRes.json()) as {
+      attachments: Array<{ original_name: string; preview_text: string | null }>;
+    };
+    expect(detail.attachments).toHaveLength(1);
+    expect(detail.attachments[0]?.original_name).toBe("notes.txt");
+    expect(detail.attachments[0]?.preview_text).toContain("hello from attachment");
   });
 
   it("registers managed agents with role/runtime metadata and default commands", async () => {

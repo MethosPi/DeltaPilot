@@ -31,6 +31,22 @@ const EVENT_TITLES = {
   report_limit: "Reported Limit",
   cancel: "Cancelled",
   dashboard_move: "Moved From Dashboard",
+  dashboard_archive: "Archived",
+  dashboard_restore: "Restored To Board",
+};
+
+const BOARD_EVENT_PREVIEW_COUNT = 4;
+const TERMINAL_THEME_STORAGE_KEY = "deltapilot-terminal-theme";
+const TERMINAL_THEME_OPTIONS = {
+  white: "White",
+  matrix: "Green",
+};
+
+const PRIORITY_TITLES = {
+  max: "Max",
+  high: "High",
+  medium: "Medium",
+  low: "Low",
 };
 
 const MANAGED_COMMAND_PRESETS = {
@@ -54,16 +70,22 @@ const state = {
   terminalBuffers: {},
   focusedTerminalSessionId: null,
   activeTab: "board",
+  boardView: "active",
   dragTaskId: null,
   moveInFlight: false,
+  attachmentUploadInFlight: false,
+  expandedTaskEvents: {},
+  terminalTheme: loadStoredTerminalTheme(),
 };
 
 const statsStrip = document.querySelector("#statsStrip");
 const board = document.querySelector("#board");
 const taskDetail = document.querySelector("#taskDetail");
+const boardKicker = document.querySelector("#boardKicker");
+const boardTitle = document.querySelector("#boardTitle");
+const boardViewTabs = document.querySelector("#boardViewTabs");
+const boardActions = document.querySelector("#boardActions");
 const handoffList = document.querySelector("#handoffList");
-const repoMeta = document.querySelector("#repoMeta");
-const dbMeta = document.querySelector("#dbMeta");
 const refreshButton = document.querySelector("#refreshButton");
 const createTaskForm = document.querySelector("#createTaskForm");
 const registerAgentForm = document.querySelector("#registerAgentForm");
@@ -108,6 +130,7 @@ setInterval(() => {
   void refreshAll({ quiet: true }).catch(reportError);
 }, 5000);
 
+applyTerminalTheme();
 syncRegisterAgentForm({ autofill: true });
 void refreshAll().catch(reportError);
 
@@ -119,12 +142,7 @@ async function refreshAll(options = {}) {
   state.snapshot = snapshot;
   state.approvals = approvals;
 
-  if (!state.selectedTaskId) {
-    const preferred = snapshot.tasks.find((task) => !["done", "cancelled"].includes(task.status));
-    state.selectedTaskId = preferred?.id ?? snapshot.tasks[0]?.id ?? null;
-  } else if (!snapshot.tasks.some((task) => task.id === state.selectedTaskId)) {
-    state.selectedTaskId = snapshot.tasks[0]?.id ?? null;
-  }
+  syncSelectedTaskId(snapshot);
 
   if (!state.selectedSessionId) {
     state.selectedSessionId = snapshot.sessions[0]?.id ?? null;
@@ -132,11 +150,7 @@ async function refreshAll(options = {}) {
     state.selectedSessionId = snapshot.sessions[0]?.id ?? null;
   }
 
-  if (state.selectedTaskId) {
-    state.taskDetail = await fetchJson(`/api/tasks/${state.selectedTaskId}`);
-  } else {
-    state.taskDetail = null;
-  }
+  await refreshSelectedTaskDetail();
 
   if (state.selectedSessionId) {
     state.sessionDetail = await fetchJson(`/api/sessions/${state.selectedSessionId}`);
@@ -150,17 +164,78 @@ async function refreshAll(options = {}) {
   }
 }
 
+function getBoardTasks(view = state.boardView, snapshot = state.snapshot) {
+  if (!snapshot) return [];
+  return snapshot.tasks.filter((task) => (
+    view === "archived" ? Boolean(task.archived_at) : !task.archived_at
+  ));
+}
+
+function preferredTask(tasks) {
+  return tasks.find((task) => !["done", "cancelled"].includes(task.status)) ?? tasks[0] ?? null;
+}
+
+function syncSelectedTaskId(snapshot = state.snapshot) {
+  if (!snapshot) {
+    state.selectedTaskId = null;
+    return;
+  }
+
+  const visibleTasks = getBoardTasks(state.boardView, snapshot);
+  if (!state.selectedTaskId) {
+    state.selectedTaskId = preferredTask(visibleTasks)?.id ?? null;
+    return;
+  }
+
+  if (!snapshot.tasks.some((task) => task.id === state.selectedTaskId)) {
+    state.selectedTaskId = preferredTask(visibleTasks)?.id ?? null;
+    return;
+  }
+
+  if (!visibleTasks.some((task) => task.id === state.selectedTaskId)) {
+    state.selectedTaskId = preferredTask(visibleTasks)?.id ?? null;
+  }
+}
+
+async function refreshSelectedTaskDetail() {
+  if (!state.selectedTaskId) {
+    state.taskDetail = null;
+    return;
+  }
+  state.taskDetail = await fetchJson(`/api/tasks/${state.selectedTaskId}`);
+}
+
+async function selectTask(taskId) {
+  state.selectedTaskId = taskId;
+  await refreshSelectedTaskDetail();
+  renderBoard();
+  renderTaskDetail();
+}
+
+async function setBoardView(view) {
+  if (view !== "active" && view !== "archived") return;
+  if (state.boardView === view) return;
+
+  const previousTaskId = state.selectedTaskId;
+  state.boardView = view;
+  syncSelectedTaskId();
+
+  if (state.selectedTaskId !== previousTaskId || !state.taskDetail) {
+    await refreshSelectedTaskDetail();
+  }
+
+  render();
+}
+
 async function createTask() {
   const form = new FormData(createTaskForm);
+  const attachments = Array.from(createTaskForm.querySelector('input[name="attachments"]').files ?? []);
   const payload = {
     title: String(form.get("title") ?? "").trim(),
     brief: String(form.get("brief") ?? "").trim(),
-    priority: Number.parseInt(String(form.get("priority") ?? "50"), 10),
+    priority: String(form.get("priority") ?? "medium").trim().toLowerCase(),
     acceptance: {
-      goal: String(form.get("goal") ?? "").trim(),
       deliverables: splitLines(form.get("deliverables")),
-      files_in_scope: splitLines(form.get("files_in_scope")),
-      success_test: String(form.get("success_test") ?? "").trim(),
     },
   };
 
@@ -169,10 +244,15 @@ async function createTask() {
     body: JSON.stringify(payload),
   });
 
+  if (attachments.length > 0) {
+    await uploadTaskFiles(detail.task.id, attachments);
+  }
+
   createTaskForm.reset();
-  createTaskForm.querySelector('input[name="priority"]').value = "50";
+  createTaskForm.querySelector('select[name="priority"]').value = "medium";
   state.selectedTaskId = detail.task.id;
   state.activeTab = "board";
+  state.boardView = "active";
   await refreshAll();
 }
 
@@ -206,10 +286,9 @@ async function registerAgent() {
 
 function render() {
   if (!state.snapshot) return;
-  repoMeta.textContent = shortenPath(state.snapshot.meta.repo_root);
-  dbMeta.textContent = shortenPath(state.snapshot.meta.db_path);
   renderTabs();
   renderStats();
+  renderBoardControls();
   renderBoard();
   renderTaskDetail();
   renderHandoffs();
@@ -231,8 +310,15 @@ function renderTabs() {
 }
 
 function renderStats() {
+  const activeTasks = getBoardTasks("active");
+  const counts = Object.fromEntries(STATUS_ORDER.map((status) => [status, 0]));
+  for (const task of activeTasks) {
+    counts[task.status] = (counts[task.status] ?? 0) + 1;
+  }
+  const archivedCount = getBoardTasks("archived").length;
+
   const items = STATUS_ORDER.map((status) => {
-    const count = state.snapshot.stats[status] ?? 0;
+    const count = counts[status] ?? 0;
     return `
       <span class="stat-item">
         <span class="status-dot status-${status}"></span>
@@ -242,12 +328,53 @@ function renderStats() {
     `;
   }).join("");
 
-  statsStrip.innerHTML = items;
+  statsStrip.innerHTML = `
+    ${items}
+    <span class="stat-item">
+      Archived
+      <strong>${archivedCount}</strong>
+    </span>
+  `;
+}
+
+function renderBoardControls() {
+  const activeCount = getBoardTasks("active").length;
+  const archivedCount = getBoardTasks("archived").length;
+  boardKicker.textContent = state.boardView === "archived" ? "Archived" : "Board";
+  boardTitle.textContent = state.boardView === "archived" ? "Archived tasks" : "Active board";
+
+  boardViewTabs.innerHTML = `
+    <button class="tab-button board-toggle ${state.boardView === "active" ? "active" : ""}" data-board-view="active" type="button">
+      Board
+      <span class="pill">${activeCount}</span>
+    </button>
+    <button class="tab-button board-toggle ${state.boardView === "archived" ? "active" : ""}" data-board-view="archived" type="button">
+      Archived
+      <span class="pill">${archivedCount}</span>
+    </button>
+  `;
+
+  boardActions.innerHTML = state.boardView === "active"
+    ? `<button id="clearBoardButton" class="ghost-button board-clear-button" type="button" ${activeCount === 0 ? "disabled" : ""}>Clear</button>`
+    : "";
+
+  boardViewTabs.querySelectorAll("[data-board-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      void setBoardView(button.dataset.boardView).catch(reportError);
+    });
+  });
+
+  boardActions.querySelector("#clearBoardButton")?.addEventListener("click", () => {
+    if (activeCount === 0) return;
+    if (!window.confirm(`Archive ${activeCount} task${activeCount === 1 ? "" : "s"} from the board?`)) return;
+    void archiveBoard().catch(reportError);
+  });
 }
 
 function renderBoard() {
+  const visibleTasks = getBoardTasks();
   const tasksByStatus = new Map(STATUS_ORDER.map((status) => [status, []]));
-  for (const task of state.snapshot.tasks) {
+  for (const task of visibleTasks) {
     tasksByStatus.get(task.status).push(task);
   }
 
@@ -271,23 +398,24 @@ function renderBoard() {
                       class="task-card ${state.selectedTaskId === task.id ? "selected" : ""}"
                       data-task-id="${task.id}"
                       type="button"
-                      draggable="true"
+                      draggable="${state.boardView === "active" ? "true" : "false"}"
                     >
                       <div class="task-card-top">
-                        <span class="priority">P${task.priority}</span>
+                        <span class="priority">${escapeHtml(priorityTitle(task.priority_label))}</span>
                         <span class="pill">${task.last_role ? escapeHtml(task.last_role) : (task.assigned_agent_name ? escapeHtml(task.assigned_agent_name) : "queue")}</span>
                       </div>
                       <h3>${escapeHtml(task.title)}</h3>
+                      ${state.boardView === "archived" && task.archived_at ? `<p class="task-card-subline">Archived ${escapeHtml(formatTimestamp(task.archived_at))}</p>` : ""}
                       ${task.status_note ? `<p class="task-card-subline">${escapeHtml(task.status_note)}</p>` : ""}
                       <footer>
                         <span>${task.assigned_agent_name ? escapeHtml(task.assigned_agent_name) : "unassigned"}</span>
-                        <span>${formatTimestamp(task.updated_at)}</span>
+                        <span>${formatTimestamp(state.boardView === "archived" && task.archived_at ? task.archived_at : task.updated_at)}</span>
                       </footer>
                     </button>
                   `,
                 )
                 .join("")
-            : `<div class="column-empty">No tasks</div>`}
+            : `<div class="column-empty">${state.boardView === "archived" ? "No archived tasks" : "No tasks"}</div>`}
         </div>
       </section>
     `;
@@ -295,9 +423,10 @@ function renderBoard() {
 
   board.querySelectorAll("[data-task-id]").forEach((card) => {
     card.addEventListener("click", () => {
-      state.selectedTaskId = card.dataset.taskId;
-      void refreshAll({ quiet: true }).catch(reportError);
+      void selectTask(card.dataset.taskId).catch(reportError);
     });
+
+    if (state.boardView !== "active") return;
 
     card.addEventListener("dragstart", (event) => {
       state.dragTaskId = card.dataset.taskId;
@@ -312,6 +441,10 @@ function renderBoard() {
       clearDropTargets();
     });
   });
+
+  if (state.boardView !== "active") {
+    return;
+  }
 
   board.querySelectorAll("[data-column-status]").forEach((column) => {
     column.addEventListener("dragover", (event) => {
@@ -343,25 +476,33 @@ function renderTaskDetail() {
     taskDetail.className = "task-detail empty-state";
     taskDetail.innerHTML = `
       <p class="panel-kicker">Task Detail</p>
-      <h2>No task selected</h2>
-      <p>Create or select a task to inspect its history.</p>
+      <h2>${state.boardView === "archived" ? "No archived task selected" : "No task selected"}</h2>
+      <p>${state.boardView === "archived" ? "Open an archived task to inspect it or restore it to the board." : "Create or select a task to inspect its history."}</p>
     `;
     return;
   }
 
-  const { task, events, artifacts, handoffs } = state.taskDetail;
+  const { task, events, artifacts, attachments, handoffs } = state.taskDetail;
+  const isArchived = Boolean(task.archived_at);
+  const eventsExpanded = Boolean(state.expandedTaskEvents[task.id]);
+  const shouldCollapseEvents = events.length > BOARD_EVENT_PREVIEW_COUNT;
+  const visibleEvents = shouldCollapseEvents && !eventsExpanded
+    ? events.slice(-BOARD_EVENT_PREVIEW_COUNT)
+    : events;
   const acceptance = task.acceptance
     ? `
       <section class="detail-section">
         <p class="detail-label">Acceptance</p>
-        <p>${escapeHtml(task.acceptance.goal)}</p>
-        <ul class="detail-list">
-          ${task.acceptance.deliverables.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
-        </ul>
+        ${task.acceptance.goal ? `<p>${escapeHtml(task.acceptance.goal)}</p>` : ""}
+        ${task.acceptance.deliverables.length > 0
+          ? `<ul class="detail-list">
+              ${task.acceptance.deliverables.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+            </ul>`
+          : ""}
         ${task.acceptance.files_in_scope.length > 0
           ? `<p class="muted">Files: ${task.acceptance.files_in_scope.map(escapeHtml).join(", ")}</p>`
           : ""}
-        <p class="muted">Success test: ${escapeHtml(task.acceptance.success_test)}</p>
+        ${task.acceptance.success_test ? `<p class="muted">Success test: ${escapeHtml(task.acceptance.success_test)}</p>` : ""}
       </section>
     `
     : "";
@@ -374,14 +515,18 @@ function renderTaskDetail() {
         <h2>${escapeHtml(task.title)}</h2>
         ${task.status_note ? `<p class="status-note">${escapeHtml(task.status_note)}</p>` : ""}
       </div>
-      <span class="detail-status status-chip"><span class="status-dot status-${task.status}"></span>${STATUS_TITLES[task.status]}</span>
+      <div class="inline-actions">
+        <span class="detail-status status-chip"><span class="status-dot status-${task.status}"></span>${STATUS_TITLES[task.status]}</span>
+        ${isArchived ? `<span class="detail-status status-chip">Archived</span>` : ""}
+      </div>
     </div>
 
     <section class="detail-section">
       <p class="detail-label">Summary</p>
       <p>${escapeHtml(task.brief || "No brief provided.")}</p>
       <div class="meta-grid">
-        <span><strong>Priority</strong> P${task.priority}</span>
+        <span><strong>Priority</strong> ${escapeHtml(priorityTitle(task.priority_label))}</span>
+        <span><strong>Board</strong> ${isArchived && task.archived_at ? `Archived ${escapeHtml(formatTimestamp(task.archived_at))}` : "Active"}</span>
         <span><strong>Assigned</strong> ${task.assigned_agent_name ? escapeHtml(task.assigned_agent_name) : "unassigned"}</span>
         <span><strong>Last Role</strong> ${task.last_role ? escapeHtml(task.last_role) : "none"}</span>
         <span><strong>Review Bounces</strong> ${task.review_bounce_count}</span>
@@ -393,13 +538,23 @@ function renderTaskDetail() {
 
     ${acceptance}
 
+    ${renderAttachmentsSection(task, attachments)}
+
     ${renderTaskActions(task)}
 
     <section class="detail-section">
-      <p class="detail-label">Task Events</p>
+      <div class="detail-label-row">
+        <p class="detail-label">Task Events</p>
+        ${shouldCollapseEvents
+          ? `<button class="detail-inline-toggle" data-toggle-events type="button">${eventsExpanded ? "Collapse" : "Expand"}</button>`
+          : ""}
+      </div>
+      ${shouldCollapseEvents && !eventsExpanded
+        ? `<p class="timeline-summary">Showing the latest ${visibleEvents.length} of ${events.length} events.</p>`
+        : ""}
       <div class="timeline">
-        ${events.length > 0
-          ? events
+        ${visibleEvents.length > 0
+          ? visibleEvents
               .map(
                 (event) => `
                   <article class="timeline-item">
@@ -471,6 +626,10 @@ function renderTaskDetail() {
         void taskAction(task.id, "approve", note).catch(reportError);
       } else if (action === "bounce") {
         void taskAction(task.id, "bounce", note).catch(reportError);
+      } else if (action === "archive") {
+        void taskAction(task.id, "archive", note).catch(reportError);
+      } else if (action === "restore") {
+        void taskAction(task.id, "restore", note).catch(reportError);
       } else if (action === "cancel") {
         void taskAction(task.id, "cancel", note).catch(reportError);
       } else if (action === "return_to_todo") {
@@ -478,6 +637,114 @@ function renderTaskDetail() {
       }
     });
   });
+
+  taskDetail.querySelector("[data-toggle-events]")?.addEventListener("click", () => {
+    state.expandedTaskEvents[task.id] = !eventsExpanded;
+    renderTaskDetail();
+  });
+
+  const attachmentForm = taskDetail.querySelector("#attachmentUploadForm");
+  attachmentForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const files = Array.from(attachmentForm.querySelector('input[name="attachments"]').files ?? []);
+    void uploadAttachmentsForSelectedTask(files).catch(reportError);
+  });
+}
+
+function renderAttachmentsSection(task, attachments) {
+  const agentMountPath = task.worktree_path ? `${task.worktree_path}/.deltapilot/attachments` : null;
+
+  return `
+    <section class="detail-section">
+      <div class="detail-section-header">
+        <div>
+          <p class="detail-label">Attachments</p>
+          <p class="muted">
+            ${agentMountPath
+              ? `Mounted for agents at ${escapeHtml(agentMountPath)}`
+              : "Attachments mount into the task worktree once the task is claimed."}
+          </p>
+        </div>
+        <span class="pill">${attachments.length} file${attachments.length === 1 ? "" : "s"}</span>
+      </div>
+
+      <form id="attachmentUploadForm" class="attachment-upload-form">
+        <label>
+          <span>Add files</span>
+          <input
+            name="attachments"
+            type="file"
+            multiple
+            accept="image/*,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.yaml,.yml,.log,.doc,.docx,.rtf,.odt,.pdf,video/*,audio/*"
+          />
+        </label>
+        <button class="secondary-button" type="submit">Upload</button>
+      </form>
+
+      ${attachments.length > 0
+        ? `<div class="attachment-list">${attachments.map((attachment) => renderAttachmentCard(task.id, attachment)).join("")}</div>`
+        : `<p class="small-empty">No attachments uploaded for this task.</p>`}
+    </section>
+  `;
+}
+
+function renderAttachmentCard(taskId, attachment) {
+  return `
+    <article class="attachment-card">
+      <div class="attachment-header">
+        <div>
+          <strong>${escapeHtml(attachment.original_name)}</strong>
+          <p class="muted">${escapeHtml(attachment.category)} · ${escapeHtml(formatBytes(attachment.size_bytes))}</p>
+        </div>
+        <div class="attachment-actions">
+          <a class="secondary-link" href="${attachmentOpenUrl(taskId, attachment.id)}" target="_blank" rel="noreferrer">Open</a>
+          <a class="secondary-link" href="${attachmentDownloadUrl(taskId, attachment.id)}">Download</a>
+        </div>
+      </div>
+      <p class="muted path-line">${escapeHtml(attachment.stored_path)}</p>
+      ${renderAttachmentPreview(taskId, attachment)}
+    </article>
+  `;
+}
+
+function renderAttachmentPreview(taskId, attachment) {
+  const previewUrl = attachmentOpenUrl(taskId, attachment.id);
+
+  if (attachment.category === "image") {
+    return `<img class="attachment-preview attachment-image" src="${previewUrl}" alt="${escapeHtml(attachment.original_name)}" loading="lazy" />`;
+  }
+
+  if (attachment.category === "audio") {
+    return `<audio class="attachment-preview" controls preload="metadata" src="${previewUrl}"></audio>`;
+  }
+
+  if (attachment.category === "video") {
+    return `<video class="attachment-preview attachment-video" controls preload="metadata" src="${previewUrl}"></video>`;
+  }
+
+  if (attachment.category === "pdf") {
+    return `
+      <object class="attachment-preview attachment-pdf" data="${previewUrl}" type="application/pdf">
+        <a class="secondary-link" href="${previewUrl}" target="_blank" rel="noreferrer">Open PDF</a>
+      </object>
+    `;
+  }
+
+  if (attachment.category === "text" && attachment.preview_text !== null) {
+    return `
+      <pre class="attachment-text-preview">${escapeHtml(attachment.preview_text)}${attachment.preview_truncated ? "\n…" : ""}</pre>
+    `;
+  }
+
+  return `<p class="muted">Inline preview is not available for this file type.</p>`;
+}
+
+function attachmentOpenUrl(taskId, attachmentId) {
+  return `/api/tasks/${taskId}/attachments/${attachmentId}`;
+}
+
+function attachmentDownloadUrl(taskId, attachmentId) {
+  return `/api/tasks/${taskId}/attachments/${attachmentId}?download=1`;
 }
 
 function renderTaskActions(task) {
@@ -492,6 +759,9 @@ function renderTaskActions(task) {
   const humanButton = task.status === "human_review"
     ? `<button class="primary-button" data-action="return_to_todo" type="button">Return To To Do</button>`
     : "";
+  const archiveButton = task.archived_at
+    ? `<button class="primary-button" data-action="restore" type="button">Restore To Board</button>`
+    : `<button class="secondary-button" data-action="archive" type="button">Archive Task</button>`;
 
   return `
     <section class="detail-section action-section">
@@ -514,6 +784,7 @@ function renderTaskActions(task) {
       ${reviewButtons}
       ${humanButton}
       <div class="inline-actions">
+        ${archiveButton}
         <button class="secondary-button" data-action="cancel" type="button">Cancel Task</button>
       </div>
     </section>
@@ -740,7 +1011,17 @@ function renderSessionDetail() {
             <span class="terminal-light green"></span>
           </div>
           <div class="terminal-toolbar-title">${escapeHtml(session.agent_name)}${session.pid ? ` · pid ${session.pid}` : ""}</div>
-          <div class="terminal-toolbar-meta">${escapeHtml(session.runtime_mode)}</div>
+          <div class="terminal-toolbar-actions">
+            <label class="terminal-theme-control">
+              <span>Theme</span>
+              <select id="terminalThemeSelect">
+                ${Object.entries(TERMINAL_THEME_OPTIONS).map(([value, label]) => (
+                  `<option value="${value}" ${state.terminalTheme === value ? "selected" : ""}>${escapeHtml(label)}</option>`
+                )).join("")}
+              </select>
+            </label>
+            <div class="terminal-toolbar-meta">${escapeHtml(session.runtime_mode)}</div>
+          </div>
         </div>
         <div
           class="terminal-screen ${state.focusedTerminalSessionId === session.id ? "focused" : ""}"
@@ -861,6 +1142,10 @@ function renderSessionDetail() {
     if (!window.confirm(`Remove session for ${session.agent_name}?`)) return;
     void deleteSession(session.id).catch(reportError);
   });
+
+  sessionDetail.querySelector("#terminalThemeSelect")?.addEventListener("change", (event) => {
+    setTerminalTheme(event.target.value);
+  });
 }
 
 async function moveTask(taskId, targetStatus, note = "") {
@@ -882,11 +1167,52 @@ async function moveTask(taskId, targetStatus, note = "") {
   }
 }
 
+async function archiveBoard() {
+  const result = await fetchJson("/api/tasks/archive-all", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  showToast(`Archived ${result.archived_count} task${result.archived_count === 1 ? "" : "s"}`, { kind: "ok" });
+  await refreshAll({ quiet: true });
+}
+
+async function uploadAttachmentsForSelectedTask(files) {
+  if (!state.selectedTaskId || files.length === 0 || state.attachmentUploadInFlight) return;
+
+  state.attachmentUploadInFlight = true;
+  try {
+    await uploadTaskFiles(state.selectedTaskId, files);
+    await refreshAll({ quiet: true });
+    showToast(`Uploaded ${files.length} attachment${files.length === 1 ? "" : "s"}.`, {
+      kind: "ok",
+    });
+  } finally {
+    state.attachmentUploadInFlight = false;
+  }
+}
+
+async function uploadTaskFiles(taskId, files) {
+  const form = new FormData();
+  for (const file of files) {
+    form.append("files", file, file.name);
+  }
+
+  return fetchJson(`/api/tasks/${taskId}/attachments`, {
+    method: "POST",
+    body: form,
+  });
+}
+
 async function taskAction(taskId, kind, note = "") {
   await fetchJson(`/api/tasks/${taskId}/actions`, {
     method: "POST",
     body: JSON.stringify({ kind, note }),
   });
+  if (kind === "archive") {
+    showToast("Task archived", { kind: "ok" });
+  } else if (kind === "restore") {
+    showToast("Task restored to board", { kind: "ok" });
+  }
   state.selectedTaskId = taskId;
   await refreshAll();
 }
@@ -1028,9 +1354,41 @@ function resolveTerminalPrompt(session) {
   return "$";
 }
 
+function setTerminalTheme(theme) {
+  if (!(theme in TERMINAL_THEME_OPTIONS)) return;
+  state.terminalTheme = theme;
+  applyTerminalTheme();
+  try {
+    window.localStorage.setItem(TERMINAL_THEME_STORAGE_KEY, theme);
+  } catch {
+    // ignore storage failures
+  }
+  renderSessionDetail();
+}
+
+function applyTerminalTheme() {
+  document.documentElement.dataset.terminalTheme = state.terminalTheme;
+}
+
+function loadStoredTerminalTheme() {
+  try {
+    const stored = window.localStorage.getItem(TERMINAL_THEME_STORAGE_KEY);
+    if (stored && stored in TERMINAL_THEME_OPTIONS) {
+      return stored;
+    }
+  } catch {
+    // ignore storage failures
+  }
+  return "white";
+}
+
+function priorityTitle(priorityLabel) {
+  return PRIORITY_TITLES[priorityLabel] ?? String(priorityLabel ?? "Unknown");
+}
+
 function buildTerminalTranscript(session, messages, approvals, logContent) {
   const lines = [
-    "DeltaPipeline managed session",
+    "DeltaPilot managed session",
     `agent=${session.agent_name} kind=${session.agent_kind} role=${session.agent_role} status=${session.status}`,
     `transport=${session.transport} started_at=${session.started_at}`,
   ];
@@ -1089,9 +1447,11 @@ function reportError(error) {
 }
 
 async function fetchJson(url, options = {}) {
+  const isFormDataBody = typeof FormData !== "undefined" && options.body instanceof FormData;
+  const defaultHeaders = isFormDataBody ? {} : { "content-type": "application/json" };
   const response = await fetch(url, {
     headers: {
-      "content-type": "application/json",
+      ...defaultHeaders,
       ...(options.headers ?? {}),
     },
     ...options,
@@ -1122,13 +1482,6 @@ function statusTitle(value) {
   return STATUS_TITLES[value] ?? value;
 }
 
-function shortenPath(value) {
-  if (!value) return "";
-  const parts = value.split("/");
-  if (parts.length <= 4) return value;
-  return `…/${parts.slice(-4).join("/")}`;
-}
-
 function formatTimestamp(value) {
   if (!value) return "never";
   return new Intl.DateTimeFormat(undefined, {
@@ -1144,6 +1497,13 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function formatBytes(sizeBytes) {
+  if (!Number.isFinite(sizeBytes)) return "0 B";
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(sizeBytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(sizeBytes / (1024 * 1024)).toFixed(sizeBytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
 function flashRefresh() {

@@ -13,6 +13,55 @@ export type TaskStatus = z.infer<typeof taskStatusSchema>;
 
 export const TERMINAL_STATUSES: ReadonlyArray<TaskStatus> = ["done", "cancelled"];
 
+export const taskPriorityLabelSchema = z.enum(["max", "high", "medium", "low"]);
+export type TaskPriorityLabel = z.infer<typeof taskPriorityLabelSchema>;
+
+export const TASK_PRIORITY_LABELS: ReadonlyArray<TaskPriorityLabel> = [
+  "max",
+  "high",
+  "medium",
+  "low",
+];
+
+export const TASK_PRIORITY_RANKS: Readonly<Record<TaskPriorityLabel, number>> = {
+  max: 100,
+  high: 75,
+  medium: 50,
+  low: 25,
+};
+
+export const DEFAULT_TASK_PRIORITY_LABEL: TaskPriorityLabel = "medium";
+export const DEFAULT_TASK_PRIORITY_RANK = TASK_PRIORITY_RANKS[DEFAULT_TASK_PRIORITY_LABEL];
+
+const TASK_PRIORITY_ENTRIES = Object.entries(TASK_PRIORITY_RANKS) as Array<[TaskPriorityLabel, number]>;
+
+export function taskPriorityRankFromLabel(label: TaskPriorityLabel): number {
+  return TASK_PRIORITY_RANKS[label];
+}
+
+export function taskPriorityLabelFromRank(rank: number): TaskPriorityLabel {
+  let closest: [TaskPriorityLabel, number] = [
+    DEFAULT_TASK_PRIORITY_LABEL,
+    TASK_PRIORITY_RANKS[DEFAULT_TASK_PRIORITY_LABEL],
+  ];
+
+  for (const [candidateLabel, candidateRank] of TASK_PRIORITY_ENTRIES) {
+    const [, bestRank] = closest;
+    const distance = Math.abs(rank - candidateRank);
+    const bestDistance = Math.abs(rank - bestRank);
+
+    if (distance < bestDistance || (distance === bestDistance && candidateRank > bestRank)) {
+      closest = [candidateLabel, candidateRank];
+    }
+  }
+
+  return closest[0];
+}
+
+export function normalizeTaskPriorityRank(rank: number): number {
+  return taskPriorityRankFromLabel(taskPriorityLabelFromRank(rank));
+}
+
 export const agentKindSchema = z.enum([
   "claude-code",
   "claude-sdk",
@@ -63,13 +112,62 @@ export const agentSchema = z.object({
 });
 export type Agent = z.infer<typeof agentSchema>;
 
-export const acceptanceCriteriaSchema = z.object({
-  goal: z.string().min(1),
-  deliverables: z.array(z.string().min(1)).min(1),
-  files_in_scope: z.array(z.string()),
-  success_test: z.string().min(1),
-});
+const acceptanceStringSchema = z.string().trim().min(1);
+const acceptanceStringListSchema = z.array(acceptanceStringSchema);
+
+export const createTaskAcceptanceSchema = z.object({
+  deliverables: acceptanceStringListSchema.min(1),
+}).strict();
+export type CreateTaskAcceptance = z.infer<typeof createTaskAcceptanceSchema>;
+
+export const acceptanceCriteriaSchema = z
+  .object({
+    goal: acceptanceStringSchema.optional(),
+    deliverables: acceptanceStringListSchema.default([]),
+    files_in_scope: acceptanceStringListSchema.default([]),
+    success_test: acceptanceStringSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      Boolean(value.goal)
+      || value.deliverables.length > 0
+      || value.files_in_scope.length > 0
+      || Boolean(value.success_test),
+    {
+      message: "acceptance must include goal, deliverables, files_in_scope, or success_test",
+    },
+  );
 export type AcceptanceCriteria = z.infer<typeof acceptanceCriteriaSchema>;
+
+export function normalizeAcceptanceCriteria(raw: unknown): AcceptanceCriteria | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const candidate = raw as Record<string, unknown>;
+  const goal = firstAcceptanceString(
+    candidate.goal,
+    candidate.acceptancegoal,
+    candidate.acceptance_goal,
+    candidate.acceptanceGoal,
+  );
+  const deliverables = normalizeAcceptanceStringList(candidate.deliverables);
+  const filesInScope = normalizeAcceptanceStringList(candidate.files_in_scope);
+  const successTest = firstAcceptanceString(candidate.success_test);
+
+  if (!goal && deliverables.length === 0 && filesInScope.length === 0 && !successTest) {
+    return null;
+  }
+
+  const result = acceptanceCriteriaSchema.safeParse({
+    ...(goal ? { goal } : {}),
+    deliverables,
+    files_in_scope: filesInScope,
+    ...(successTest ? { success_test: successTest } : {}),
+  });
+
+  return result.success ? result.data : null;
+}
 
 export const taskSchema = z.object({
   id: z.string().uuid(),
@@ -112,6 +210,28 @@ export const artifactSchema = z.object({
   created_at: z.string().datetime(),
 });
 export type Artifact = z.infer<typeof artifactSchema>;
+
+export const taskAttachmentCategorySchema = z.enum([
+  "image",
+  "text",
+  "document",
+  "pdf",
+  "video",
+  "audio",
+]);
+export type TaskAttachmentCategory = z.infer<typeof taskAttachmentCategorySchema>;
+
+export const taskAttachmentSchema = z.object({
+  id: z.string().uuid(),
+  task_id: z.string().uuid(),
+  original_name: z.string().min(1),
+  stored_path: z.string(),
+  mime_type: z.string().min(1),
+  size_bytes: z.number().int().nonnegative(),
+  category: taskAttachmentCategorySchema,
+  created_at: z.string().datetime(),
+});
+export type TaskAttachment = z.infer<typeof taskAttachmentSchema>;
 
 export const handoffSchema = z.object({
   id: z.string().uuid(),
@@ -209,3 +329,29 @@ export const taskEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("bounce"), note: z.string() }),
 ]);
 export type TaskEvent = z.infer<typeof taskEventSchema>;
+
+function normalizeAcceptanceStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function firstAcceptanceString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+
+    const normalized = value.trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return undefined;
+}

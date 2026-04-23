@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -21,10 +23,26 @@ import type {
   AgentSession,
   ApprovalRequest,
   SessionMessage,
+  TaskAttachment,
   Task,
   TaskStatus,
+  TaskPriorityLabel,
+} from "@deltapilot/shared";
+import {
+  normalizeAcceptanceCriteria,
+  taskPriorityLabelFromRank,
+  taskPriorityLabelSchema,
+  taskPriorityRankFromLabel,
 } from "@deltapilot/shared";
 import { spawn as spawnPty, type IPty } from "node-pty";
+import {
+  MAX_TASK_ATTACHMENT_BYTES,
+  MAX_TASK_ATTACHMENT_UPLOAD_BYTES,
+  makeContentDisposition,
+  persistTaskAttachments,
+  readTextAttachmentPreview,
+  type AttachmentUpload,
+} from "./task-attachments.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +51,7 @@ const publicDir = existsSync(path.join(__dirname, "public"))
   ? path.join(__dirname, "public")
   : path.resolve(__dirname, "../public");
 const MAX_BODY_SIZE = 1024 * 1024;
+const TEXT_ATTACHMENT_INLINE_BYTES = 512 * 1024;
 
 const TASK_STATUS_ORDER: TaskStatus[] = [
   "todo",
@@ -79,6 +98,7 @@ interface TaskRow {
   updated_at: string;
   claimed_at: string | null;
   last_heartbeat_at: string | null;
+  archived_at: string | null;
 }
 
 interface AgentRow {
@@ -181,6 +201,17 @@ interface MessageRow {
   created_at: string;
 }
 
+interface TaskAttachmentRow {
+  id: string;
+  task_id: string;
+  original_name: string;
+  stored_path: string;
+  mime_type: string;
+  size_bytes: number;
+  category: TaskAttachment["category"];
+  created_at: string;
+}
+
 export interface DashboardServerOptions {
   repoRoot: string;
   dbPath: string;
@@ -206,6 +237,7 @@ export interface DashboardTaskSummary {
   brief: string;
   status: TaskStatus;
   priority: number;
+  priority_label: TaskPriorityLabel;
   assigned_agent_id: string | null;
   assigned_agent_name: string | null;
   branch_name: string | null;
@@ -219,6 +251,7 @@ export interface DashboardTaskSummary {
   updated_at: string;
   claimed_at: string | null;
   last_heartbeat_at: string | null;
+  archived_at: string | null;
 }
 
 export interface DashboardAgentSummary extends Agent {
@@ -266,7 +299,13 @@ export interface DashboardTaskDetail {
   task: DashboardTaskSummary;
   events: DashboardTaskEvent[];
   artifacts: DashboardArtifact[];
+  attachments: DashboardTaskAttachment[];
   handoffs: DashboardHandoff[];
+}
+
+export interface DashboardTaskAttachment extends TaskAttachment {
+  preview_text: string | null;
+  preview_truncated: boolean;
 }
 
 export interface DashboardSessionSummary {
@@ -501,6 +540,24 @@ async function handleRequest(
     return;
   }
 
+  const taskAttachmentsMatch = pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/attachments$/i);
+  if (method === "POST" && taskAttachmentsMatch) {
+    const taskId = taskAttachmentsMatch[1];
+    if (!taskId) throw new HttpError(400, "task id is required");
+    const attachments = await uploadTaskAttachments(context, req, taskId);
+    sendJson(res, 201, { attachments });
+    return;
+  }
+
+  const taskAttachmentMatch = pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/attachments\/([0-9a-f-]+)$/i);
+  if (method === "GET" && taskAttachmentMatch) {
+    const taskId = taskAttachmentMatch[1];
+    const attachmentId = taskAttachmentMatch[2];
+    if (!taskId || !attachmentId) throw new HttpError(400, "attachment id is required");
+    await streamTaskAttachment(context, req, res, taskId, attachmentId, url.searchParams);
+    return;
+  }
+
   const sessionMatch = pathname.match(/^\/api\/sessions\/([0-9a-f-]+)$/i);
   if (method === "GET" && sessionMatch) {
     const sessionId = sessionMatch[1];
@@ -521,6 +578,12 @@ async function handleRequest(
     const body = await readJsonBody(req);
     const task = await createTaskFromBody(context, body);
     sendJson(res, 201, await loadTaskDetail(context, task.id));
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/tasks/archive-all") {
+    const archivedCount = archiveAllTasks(context);
+    sendJson(res, 200, { archived_count: archivedCount });
     return;
   }
 
@@ -739,6 +802,45 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+async function readMultipartFormData(req: IncomingMessage): Promise<FormData> {
+  const contentType = req.headers["content-type"];
+  if (typeof contentType !== "string" || !contentType.includes("multipart/form-data")) {
+    throw new HttpError(400, "attachment upload requires multipart/form-data");
+  }
+
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === undefined) continue;
+    headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+  }
+
+  const request = new Request("http://localhost", {
+    method: req.method ?? "POST",
+    headers,
+    body: Readable.toWeb(req) as ReadableStream<Uint8Array>,
+    duplex: "half",
+  });
+
+  try {
+    return await request.formData();
+  } catch {
+    throw new HttpError(400, "request body is not valid multipart form data");
+  }
+}
+
+function isUploadedFile(value: unknown): value is AttachmentUpload {
+  const candidate = value as Partial<AttachmentUpload> | null;
+  return (
+    typeof value !== "string"
+    && candidate !== null
+    && typeof candidate === "object"
+    && typeof candidate.name === "string"
+    && typeof candidate.size === "number"
+    && typeof candidate.type === "string"
+    && typeof candidate.arrayBuffer === "function"
+  );
+}
+
 function isAuthorized(
   req: IncomingMessage,
   auth: NonNullable<DashboardServerOptions["auth"]>,
@@ -792,7 +894,125 @@ async function loadTaskDetail(
     events: selectTaskEvents(context.conn.raw, taskId),
     handoffs: selectHandoffs(context.conn.raw, taskId),
     artifacts: await selectArtifacts(context.conn.raw, taskId),
+    attachments: await selectTaskAttachments(context.conn.raw, taskId),
   };
+}
+
+async function uploadTaskAttachments(
+  context: DashboardContext,
+  req: IncomingMessage,
+  taskId: string,
+): Promise<DashboardTaskAttachment[]> {
+  if (!selectTaskRowById(context.conn.raw, taskId)) {
+    throw new HttpError(404, `Task not found: ${taskId}`);
+  }
+
+  const contentLength = Number.parseInt(String(req.headers["content-length"] ?? "0"), 10);
+  if (Number.isFinite(contentLength) && contentLength > MAX_TASK_ATTACHMENT_UPLOAD_BYTES) {
+    throw new HttpError(
+      413,
+      `attachment upload exceeds the ${Math.floor(MAX_TASK_ATTACHMENT_UPLOAD_BYTES / (1024 * 1024))} MB request limit`,
+    );
+  }
+
+  const formData = await readMultipartFormData(req);
+  const files = Array.from(formData.values()).filter((value) => isUploadedFile(value)) as AttachmentUpload[];
+  if (files.length === 0) {
+    throw new HttpError(400, "attachment upload requires at least one file");
+  }
+
+  const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+  if (totalSize > MAX_TASK_ATTACHMENT_UPLOAD_BYTES) {
+    throw new HttpError(
+      413,
+      `attachment upload exceeds the ${Math.floor(MAX_TASK_ATTACHMENT_UPLOAD_BYTES / (1024 * 1024))} MB request limit`,
+    );
+  }
+
+  for (const file of files) {
+    if (file.size > MAX_TASK_ATTACHMENT_BYTES) {
+      throw new HttpError(
+        413,
+        `attachment "${file.name}" exceeds the ${Math.floor(MAX_TASK_ATTACHMENT_BYTES / (1024 * 1024))} MB per-file limit`,
+      );
+    }
+  }
+
+  let attachments: TaskAttachment[];
+  try {
+    attachments = await persistTaskAttachments({
+      files,
+      taskId,
+      worktreeMgr: context.worktreeMgr,
+    });
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    context.conn.raw.transaction(() => {
+      const statement = context.conn.raw.prepare(
+        `INSERT INTO task_attachments
+         (id, task_id, original_name, stored_path, mime_type, size_bytes, category, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+
+      for (const attachment of attachments) {
+        statement.run(
+          attachment.id,
+          attachment.task_id,
+          attachment.original_name,
+          attachment.stored_path,
+          attachment.mime_type,
+          attachment.size_bytes,
+          attachment.category,
+          attachment.created_at,
+        );
+      }
+    })();
+  } catch (error) {
+    await Promise.all(attachments.map((attachment) => rm(attachment.stored_path, { force: true })));
+    throw error;
+  }
+
+  return selectTaskAttachments(context.conn.raw, taskId);
+}
+
+async function streamTaskAttachment(
+  context: DashboardContext,
+  _req: IncomingMessage,
+  res: ServerResponse,
+  taskId: string,
+  attachmentId: string,
+  searchParams: URLSearchParams,
+): Promise<void> {
+  if (!selectTaskRowById(context.conn.raw, taskId)) {
+    throw new HttpError(404, `Task not found: ${taskId}`);
+  }
+
+  const attachment = selectTaskAttachmentById(context.conn.raw, taskId, attachmentId);
+  if (!attachment) {
+    throw new HttpError(404, `Attachment not found: ${attachmentId}`);
+  }
+
+  if (!existsSync(attachment.stored_path)) {
+    throw new HttpError(404, `Attachment file missing on disk: ${attachment.original_name}`);
+  }
+
+  const inlineAllowed =
+    searchParams.get("download") !== "1"
+    && (attachment.category !== "text" || attachment.size_bytes <= TEXT_ATTACHMENT_INLINE_BYTES);
+
+  res.statusCode = 200;
+  res.setHeader("Content-Type", attachment.mime_type);
+  res.setHeader(
+    "Content-Disposition",
+    makeContentDisposition(attachment.original_name, inlineAllowed ? "inline" : "attachment"),
+  );
+  res.setHeader("Content-Length", String(attachment.size_bytes));
+  res.setHeader("X-Content-Type-Options", "nosniff");
+
+  await pipeline(createReadStream(attachment.stored_path), res);
 }
 
 async function loadSessionDetail(
@@ -1001,6 +1221,12 @@ async function applyDashboardAction(
       await context.orch.reviewDecision(taskId, { decision: "bounce", note });
       return;
     }
+    case "archive":
+      setTaskArchivedState(context, taskId, true, typeof parsed.note === "string" ? parsed.note.trim() : "");
+      return;
+    case "restore":
+      setTaskArchivedState(context, taskId, false, typeof parsed.note === "string" ? parsed.note.trim() : "");
+      return;
     case "cancel":
       await context.orch.cancelTask(taskId);
       return;
@@ -1009,12 +1235,26 @@ async function applyDashboardAction(
   }
 }
 
-function parsePriority(raw: unknown): number | undefined {
+function parsePriority(raw: unknown): number | TaskPriorityLabel | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
-  if (typeof raw !== "number" && typeof raw !== "string") {
-    throw new HttpError(400, "priority must be a number");
+  if (typeof raw === "string") {
+    const normalized = raw.trim().toLowerCase();
+    const parsedLabel = taskPriorityLabelSchema.safeParse(normalized);
+    if (parsedLabel.success) {
+      return parsedLabel.data;
+    }
+    const parsedNumeric = Number.parseInt(normalized, 10);
+    if (Number.isInteger(parsedNumeric) && parsedNumeric >= 0 && parsedNumeric <= 100) {
+      return parsedNumeric;
+    }
+    throw new HttpError(400, "priority must be max, high, medium, low, or an integer between 0 and 100");
   }
-  const parsed = typeof raw === "number" ? raw : Number.parseInt(raw, 10);
+
+  if (typeof raw !== "number") {
+    throw new HttpError(400, "priority must be max, high, medium, low, or an integer between 0 and 100");
+  }
+
+  const parsed = raw;
   if (!Number.isInteger(parsed) || parsed < 0 || parsed > 100) {
     throw new HttpError(400, "priority must be an integer between 0 and 100");
   }
@@ -1056,18 +1296,11 @@ function parseAcceptance(raw: unknown): AcceptanceCriteria | undefined {
     return undefined;
   }
 
-  if (!goal || deliverables.length === 0 || !successTest) {
-    throw new HttpError(
-      400,
-      "acceptance requires goal, deliverables, and success_test when provided",
-    );
-  }
-
   return {
-    goal,
+    ...(goal ? { goal } : {}),
     deliverables,
     files_in_scope: filesInScope,
-    success_test: successTest,
+    ...(successTest ? { success_test: successTest } : {}),
   };
 }
 
@@ -1116,6 +1349,87 @@ function moveTaskFromDashboard(
     );
 }
 
+function setTaskArchivedState(
+  context: DashboardContext,
+  taskId: string,
+  archived: boolean,
+  note: string,
+): void {
+  const task = selectTaskRowById(context.conn.raw, taskId);
+  if (!task) throw new HttpError(404, `Task not found: ${taskId}`);
+
+  if (archived && task.archived_at) return;
+  if (!archived && !task.archived_at) return;
+
+  const ts = new Date().toISOString();
+  context.conn.raw
+    .prepare(
+      `UPDATE tasks
+         SET archived_at = ?,
+             updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(archived ? ts : null, ts, taskId);
+
+  context.conn.raw
+    .prepare(
+      `INSERT INTO task_events
+       (id, task_id, kind, payload_json, actor_agent_id, from_status, to_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      taskId,
+      archived ? "dashboard_archive" : "dashboard_restore",
+      JSON.stringify({
+        note: note || null,
+        archived_at: archived ? ts : null,
+        restored: !archived,
+      }),
+      null,
+      task.status,
+      task.status,
+      ts,
+    );
+}
+
+function archiveAllTasks(context: DashboardContext): number {
+  const rows = context.conn.raw
+    .prepare("SELECT id FROM tasks WHERE archived_at IS NULL")
+    .all() as Array<{ id: string }>;
+
+  if (rows.length === 0) return 0;
+
+  const archiveTask = context.conn.raw.prepare(
+    `UPDATE tasks
+       SET archived_at = ?,
+           updated_at = ?
+     WHERE id = ?`,
+  );
+  const insertEvent = context.conn.raw.prepare(
+    `INSERT INTO task_events
+     (id, task_id, kind, payload_json, actor_agent_id, from_status, to_status, created_at)
+     SELECT ?, id, 'dashboard_archive', ?, NULL, status, status, ?
+     FROM tasks
+     WHERE id = ?`,
+  );
+
+  const ts = new Date().toISOString();
+  context.conn.raw.transaction(() => {
+    for (const row of rows) {
+      archiveTask.run(ts, ts, row.id);
+      insertEvent.run(
+        crypto.randomUUID(),
+        JSON.stringify({ note: "board_clear", archived_at: ts }),
+        ts,
+        row.id,
+      );
+    }
+  })();
+
+  return rows.length;
+}
+
 function selectTasks(raw: OpenDatabaseResult["raw"]): DashboardTaskSummary[] {
   const rows = raw
     .prepare(
@@ -1124,6 +1438,7 @@ function selectTasks(raw: OpenDatabaseResult["raw"]): DashboardTaskSummary[] {
       FROM tasks
       LEFT JOIN agents ON agents.id = tasks.assigned_agent_id
       ORDER BY
+        CASE WHEN tasks.archived_at IS NULL THEN 0 ELSE 1 END,
         CASE tasks.status
           WHEN 'todo' THEN 0
           WHEN 'planning' THEN 1
@@ -1266,6 +1581,42 @@ async function selectArtifacts(
   );
 }
 
+async function selectTaskAttachments(
+  raw: OpenDatabaseResult["raw"],
+  taskId: string,
+): Promise<DashboardTaskAttachment[]> {
+  const rows = raw
+    .prepare(
+      `
+      SELECT *
+      FROM task_attachments
+      WHERE task_id = ?
+      ORDER BY created_at DESC
+      `,
+    )
+    .all(taskId) as TaskAttachmentRow[];
+
+  return Promise.all(rows.map((row) => mapTaskAttachment(row)));
+}
+
+function selectTaskAttachmentById(
+  raw: OpenDatabaseResult["raw"],
+  taskId: string,
+  attachmentId: string,
+): TaskAttachmentRow | null {
+  const row = raw
+    .prepare(
+      `
+      SELECT *
+      FROM task_attachments
+      WHERE task_id = ? AND id = ?
+      `,
+    )
+    .get(taskId, attachmentId) as TaskAttachmentRow | undefined;
+
+  return row ?? null;
+}
+
 function selectHandoffs(
   raw: OpenDatabaseResult["raw"],
   taskId?: string,
@@ -1404,10 +1755,14 @@ function selectApprovals(
 }
 
 function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskSummary {
-  const acceptance =
-    row.acceptance_json !== null
-      ? (JSON.parse(row.acceptance_json) as AcceptanceCriteria)
-      : null;
+  let acceptance: AcceptanceCriteria | null = null;
+  if (row.acceptance_json !== null) {
+    try {
+      acceptance = normalizeAcceptanceCriteria(JSON.parse(row.acceptance_json));
+    } catch {
+      acceptance = null;
+    }
+  }
 
   return {
     id: row.id,
@@ -1415,6 +1770,7 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
     brief: row.brief,
     status: row.status as TaskStatus,
     priority: row.priority,
+    priority_label: taskPriorityLabelFromRank(row.priority),
     assigned_agent_id: row.assigned_agent_id,
     assigned_agent_name: assignedAgentName,
     branch_name: row.branch_name,
@@ -1428,6 +1784,31 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
     updated_at: row.updated_at,
     claimed_at: row.claimed_at,
     last_heartbeat_at: row.last_heartbeat_at,
+    archived_at: row.archived_at,
+  };
+}
+
+async function mapTaskAttachment(row: TaskAttachmentRow): Promise<DashboardTaskAttachment> {
+  let previewText: string | null = null;
+  let previewTruncated = false;
+
+  if (row.category === "text" && existsSync(row.stored_path)) {
+    const preview = await readTextAttachmentPreview(row.stored_path);
+    previewText = preview.previewText;
+    previewTruncated = preview.truncated;
+  }
+
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    original_name: row.original_name,
+    stored_path: row.stored_path,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes,
+    category: row.category,
+    created_at: row.created_at,
+    preview_text: previewText,
+    preview_truncated: previewTruncated,
   };
 }
 
@@ -1831,7 +2212,7 @@ async function tryCodexAgentReply(input: {
   await mkdir(runtimeDir, { recursive: true });
   const outputPath = path.join(runtimeDir, `${session.id}-reply.txt`);
   const prompt = [
-    "You are the DeltaPipeline managed agent answering a human from the dashboard.",
+    "You are the DeltaPilot managed agent answering a human from the dashboard.",
     "Reply directly, concisely, and in plain text.",
     "Do not modify files. Do not create commits. Do not ask follow-up questions unless there is no context.",
     task
