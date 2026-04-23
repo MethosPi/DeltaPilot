@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>DeltaPilot Dashboard</title>
+    <title>DeltaPipeline</title>
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
     <link rel="stylesheet" href="/styles.css" />
@@ -12,8 +12,7 @@
     <div class="page-shell">
       <header class="hero">
         <div>
-          <p class="eyebrow">DeltaPilot</p>
-          <h1>Agent Handoff Dashboard</h1>
+          <h1 class="matrix-title">DeltaPipeline</h1>
         </div>
         <div class="hero-actions">
           <div class="poll-indicator">
@@ -24,48 +23,89 @@
         </div>
       </header>
 
+      <section class="tabs" id="tabBar">
+        <button class="tab-button active" data-tab="board" type="button">Board</button>
+        <button class="tab-button" data-tab="agents" type="button">Agents</button>
+        <button class="tab-button" data-tab="sessions" type="button">Sessions</button>
+      </section>
+
       <section class="stats-strip" id="statsStrip"></section>
 
-      <main class="layout">
-        <aside class="sidebar">
-          <section class="panel create-panel">
+      <section class="tab-panel active" data-panel="board">
+        <main class="layout">
+          <aside class="sidebar">
+            <section class="panel create-panel">
+              <div class="panel-header">
+                <p class="panel-kicker">Create Task</p>
+                <h2>Create in To Do</h2>
+              </div>
+              <form id="createTaskForm" class="task-form">
+                <label>
+                  <span>Title</span>
+                  <input name="title" type="text" required />
+                </label>
+                <label>
+                  <span>Brief</span>
+                  <textarea name="brief" rows="4"></textarea>
+                </label>
+                <label>
+                  <span>Priority (0-100)</span>
+                  <input name="priority" type="number" min="0" max="100" value="50" />
+                </label>
+                <label>
+                  <span>Acceptance Goal</span>
+                  <input name="goal" type="text" placeholder="Optional" />
+                </label>
+                <label>
+                  <span>Deliverables</span>
+                  <textarea name="deliverables" rows="3" placeholder="One per line"></textarea>
+                </label>
+                <label>
+                  <span>Files In Scope</span>
+                  <textarea name="files_in_scope" rows="3" placeholder="One per line"></textarea>
+                </label>
+                <label>
+                  <span>Success Test</span>
+                  <input name="success_test" type="text" placeholder="Optional" />
+                </label>
+                <button class="primary-button" type="submit">Create Task</button>
+              </form>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <p class="panel-kicker">Recent Handoffs</p>
+                <h2>Last requeues</h2>
+              </div>
+              <div id="handoffList" class="handoff-list"></div>
+            </section>
+          </aside>
+
+          <section class="board-panel panel">
             <div class="panel-header">
-              <p class="panel-kicker">Create Task</p>
-              <h2>Create in To Do</h2>
+              <div>
+                <p class="panel-kicker">Board</p>
+              </div>
+              <div class="meta-badges">
+                <span id="repoMeta" class="meta-badge"></span>
+                <span id="dbMeta" class="meta-badge"></span>
+              </div>
             </div>
-            <form id="createTaskForm" class="task-form">
-              <label>
-                <span>Title</span>
-                <input name="title" type="text" required />
-              </label>
-              <label>
-                <span>Brief</span>
-                <textarea name="brief" rows="4"></textarea>
-              </label>
-              <label>
-                <span>Priority (0-100)</span>
-                <input name="priority" type="number" min="0" max="100" value="50" />
-              </label>
-              <label>
-                <span>Acceptance Goal</span>
-                <input name="goal" type="text" placeholder="Optional" />
-              </label>
-              <label>
-                <span>Deliverables</span>
-                <textarea name="deliverables" rows="3" placeholder="One per line"></textarea>
-              </label>
-              <label>
-                <span>Files In Scope</span>
-                <textarea name="files_in_scope" rows="3" placeholder="One per line"></textarea>
-              </label>
-              <label>
-                <span>Success Test</span>
-                <input name="success_test" type="text" placeholder="Optional" />
-              </label>
-              <button class="primary-button" type="submit">Create Task</button>
-            </form>
+            <div id="board" class="board"></div>
           </section>
 
+          <aside class="detail-panel panel">
+            <div id="taskDetail" class="task-detail empty-state">
+              <p class="panel-kicker">Task Detail</p>
+              <h2>Select a task</h2>
+              <p>Pick any card in the board to inspect events, handoffs, artifacts, and available actions.</p>
+            </div>
+          </aside>
+        </main>
+      </section>
+
+      <section class="tab-panel" data-panel="agents" hidden>
+        <main class="tab-grid">
           <section class="panel">
             <div class="panel-header">
               <p class="panel-kicker">Register Agent</p>
@@ -74,62 +114,93 @@
             <form id="registerAgentForm" class="task-form">
               <label>
                 <span>Name</span>
-                <input name="name" type="text" required placeholder="e.g. claude-code-1" />
+                <input name="name" type="text" required placeholder="e.g. codex-planner-1" />
               </label>
               <label>
                 <span>Kind</span>
                 <select name="kind" required>
-                  <option value="claude-code">claude-code</option>
-                  <option value="claude-sdk">claude-sdk</option>
                   <option value="codex">codex</option>
-                  <option value="opendevin">opendevin</option>
-                  <option value="hermes">hermes</option>
-                  <option value="mock">mock</option>
+                  <option value="claude-code">claude-code</option>
+                  <option value="openclaw">openclaw</option>
                   <option value="other">other</option>
                 </select>
               </label>
-              <button class="primary-button" type="submit">Register</button>
+              <label>
+                <span>Role</span>
+                <select name="role" required>
+                  <option value="planner">planner</option>
+                  <option value="executor">executor</option>
+                  <option value="reviewer">reviewer</option>
+                </select>
+              </label>
+              <label>
+                <span>Runtime Mode</span>
+                <select name="runtime_mode" required>
+                  <option value="managed">managed</option>
+                  <option value="external">external</option>
+                </select>
+              </label>
+              <label>
+                <span>Transport</span>
+                <select name="transport" required>
+                  <option value="mcp-stdio">mcp-stdio</option>
+                  <option value="http">http</option>
+                </select>
+              </label>
+              <label>
+                <span>Command</span>
+                <input
+                  name="command"
+                  type="text"
+                  list="managedCommandSuggestions"
+                  placeholder="Suggested automatically for managed agents"
+                />
+                <p class="field-hint" id="commandHint">Suggested automatically for managed agents.</p>
+              </label>
+              <label>
+                <span>Endpoint</span>
+                <input name="endpoint" type="text" placeholder="Optional for external agents" />
+                <p class="field-hint" id="endpointHint">Used only for external agents.</p>
+              </label>
+              <button class="primary-button" type="submit">Register Agent</button>
             </form>
+            <datalist id="managedCommandSuggestions"></datalist>
           </section>
 
           <section class="panel">
             <div class="panel-header">
               <p class="panel-kicker">Agents</p>
-              <h2>Registered workers</h2>
+              <h2>Role pools</h2>
             </div>
             <div id="agentsList" class="agent-list"></div>
           </section>
+        </main>
+      </section>
+
+      <section class="tab-panel" data-panel="sessions" hidden>
+        <main class="tab-grid sessions-grid">
+          <section class="panel stack-panel">
+            <div class="panel-header">
+              <p class="panel-kicker">Approvals</p>
+              <h2>Pending inbox</h2>
+            </div>
+            <div id="approvalList" class="approval-list"></div>
+            <div class="panel-header">
+              <p class="panel-kicker">Managed Sessions</p>
+              <h2>Live workers</h2>
+            </div>
+            <div id="sessionsList" class="session-list"></div>
+          </section>
 
           <section class="panel">
-            <div class="panel-header">
-              <p class="panel-kicker">Recent Handoffs</p>
-              <h2>Last requeues</h2>
+            <div id="sessionDetail" class="task-detail empty-state">
+              <p class="panel-kicker">Session Detail</p>
+              <h2>Select a session</h2>
+              <p>Inspect logs, pending approvals, and send replies to managed agents from here.</p>
             </div>
-            <div id="handoffList" class="handoff-list"></div>
           </section>
-        </aside>
-
-        <section class="board-panel panel">
-          <div class="panel-header">
-            <div>
-              <p class="panel-kicker">Board</p>
-            </div>
-            <div class="meta-badges">
-              <span id="repoMeta" class="meta-badge"></span>
-              <span id="dbMeta" class="meta-badge"></span>
-            </div>
-          </div>
-          <div id="board" class="board"></div>
-        </section>
-
-        <aside class="detail-panel panel">
-          <div id="taskDetail" class="task-detail empty-state">
-            <p class="panel-kicker">Task Detail</p>
-            <h2>Select a task</h2>
-            <p>Pick any card in the board to inspect events, handoffs, artifacts, and available actions.</p>
-          </div>
-        </aside>
-      </main>
+        </main>
+      </section>
     </div>
 
     <div id="toastContainer" class="toast-container"></div>

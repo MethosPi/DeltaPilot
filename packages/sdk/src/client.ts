@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { Handoff, Task } from "@deltapilot/shared";
+import type { AcceptanceCriteria, Handoff, ReviewDecision, Task } from "@deltapilot/shared";
 import type { HandoffClient, HandoffReason } from "./interceptor.js";
 
 export interface ConnectOptions {
@@ -51,10 +51,40 @@ export class DeltaPilotClient implements HandoffClient {
     return parseJson<Task | null>(res);
   }
 
+  async createTask(input: {
+    title: string;
+    brief?: string;
+    priority?: number;
+    acceptance?: AcceptanceCriteria;
+  }): Promise<Task> {
+    const res = await this.client.callTool({ name: "create_task", arguments: input });
+    return parseJson<Task>(res);
+  }
+
+  async publishPlan(taskId: string, plan: string): Promise<Task> {
+    const res = await this.client.callTool({
+      name: "publish_plan",
+      arguments: { task_id: taskId, plan },
+    });
+    return parseJson<Task>(res);
+  }
+
   async submitWork(taskId: string, commitSha?: string): Promise<Task> {
     const args: Record<string, string> = { task_id: taskId };
     if (commitSha !== undefined) args.commit_sha = commitSha;
     const res = await this.client.callTool({ name: "submit_work", arguments: args });
+    return parseJson<Task>(res);
+  }
+
+  async submitReview(taskId: string, decision: ReviewDecision, note?: string): Promise<Task> {
+    const res = await this.client.callTool({
+      name: "submit_review",
+      arguments: {
+        task_id: taskId,
+        decision,
+        ...(note !== undefined ? { note } : {}),
+      },
+    });
     return parseJson<Task>(res);
   }
 

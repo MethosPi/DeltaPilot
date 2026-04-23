@@ -19,7 +19,7 @@ async function makeRepo(): Promise<string> {
   return dir;
 }
 
-describe("handoff e2e — walking skeleton", () => {
+describe("handoff e2e — autonomous pipeline", () => {
   let repoRoot: string;
   let conn: OpenDatabaseResult;
   let orch: Orchestrator;
@@ -46,20 +46,30 @@ describe("handoff e2e — walking skeleton", () => {
   });
 
   it(
-    "Agent A hits rate limit mid-task → Agent B resumes → task reaches Done with commits from both on the same branch",
+    "executor A hits a rate limit mid-task -> executor B resumes -> reviewer approves -> task reaches Done on the same branch",
     async () => {
-      const agentA = await orch.registerAgent({
-        name: "A",
+      const planner = await orch.registerAgent({
+        name: "planner",
         kind: "mock",
+        role: "planner",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const agentA = await orch.registerAgent({
+        name: "executor-a",
+        kind: "mock",
+        role: "executor",
+        runtimeMode: "external",
         transport: "mcp-stdio",
       });
       const agentB = await orch.registerAgent({
-        name: "B",
+        name: "executor-b",
         kind: "mock",
+        role: "executor",
+        runtimeMode: "external",
         transport: "mcp-stdio",
       });
 
-      // Create and graduate a task.
       const created = await orch.createTask({
         title: "Add greeting",
         brief: "Ship a greeting function",
@@ -70,11 +80,12 @@ describe("handoff e2e — walking skeleton", () => {
           success_test: "file exists and contains 'hello'",
         },
       });
-      expect(created.status).toBe("init");
+      expect(created.status).toBe("todo");
 
-      orch.applyEvent(created.id, { kind: "ready" });
+      const planned = await orch.claimNextTask(planner.id);
+      expect(planned?.status).toBe("planning");
+      await orch.publishPlan(created.id, planner.id, "Implement greeting.txt and verify it");
 
-      // Agent A claims.
       const claimedByA = await orch.claimNextTask(agentA.id);
       expect(claimedByA?.id).toBe(created.id);
       expect(claimedByA?.status).toBe("in_progress");
@@ -83,7 +94,6 @@ describe("handoff e2e — walking skeleton", () => {
       const agentAWorktree = claimedByA!.worktree_path!;
       expect(existsSync(agentAWorktree)).toBe(true);
 
-      // Agent A makes partial progress then hits a rate limit.
       const mockA = new MockAgent(agentA.id, orch);
       await mockA.workOn(claimedByA!, [
         { kind: "commit", file: "greeting.txt", content: "hel", message: "wip: start greeting" },
@@ -94,9 +104,8 @@ describe("handoff e2e — walking skeleton", () => {
         { kind: "limit", reason: "rate_limit" },
       ]);
 
-      // Task now handoff_pending; worktree removed; handoff recorded.
       const afterLimit = orch.getTask(created.id);
-      expect(afterLimit.status).toBe("handoff_pending");
+      expect(afterLimit.status).toBe("in_progress");
       expect(afterLimit.assigned_agent_id).toBeNull();
       expect(afterLimit.worktree_path).toBeNull();
       expect(existsSync(agentAWorktree)).toBe(false);
@@ -111,13 +120,11 @@ describe("handoff e2e — walking skeleton", () => {
       expect(handoffRow!.from_agent_id).toBe(agentA.id);
       expect(handoffRow!.snapshot_commit).toBeTruthy();
 
-      // Artifacts should be readable by the next agent.
       const scratchpad = await orch.readArtifact(created.id, "scratchpad");
       expect(scratchpad).toContain("halfway through greeting");
       const nextSteps = await orch.readArtifact(created.id, "next_steps");
       expect(nextSteps).toContain("append final 'o'");
 
-      // Agent B claims — resumes the same branch.
       const claimedByB = await orch.claimNextTask(agentB.id);
       expect(claimedByB?.id).toBe(created.id);
       expect(claimedByB?.status).toBe("in_progress");
@@ -126,7 +133,6 @@ describe("handoff e2e — walking skeleton", () => {
       expect(claimedByB?.worktree_path).toBeTruthy();
       expect(existsSync(claimedByB!.worktree_path!)).toBe(true);
 
-      // Agent B finishes and submits.
       const mockB = new MockAgent(agentB.id, orch);
       await mockB.workOn(claimedByB!, [
         { kind: "commit", file: "greeting.txt", content: "hello", message: "finish greeting" },
@@ -135,18 +141,12 @@ describe("handoff e2e — walking skeleton", () => {
 
       expect(orch.getTask(created.id).status).toBe("review");
 
-      // Human approves via UI/CLI.
-      orch.applyEvent(created.id, { kind: "approve" });
+      await orch.reviewDecision(created.id, { decision: "approve", note: "Looks good" });
       expect(orch.getTask(created.id).status).toBe("done");
 
-      // All commits from both agents must live on the same task branch, in order.
       const branch = claimedByA!.branch_name!;
-      const { stdout: log } = await execa(
-        "git",
-        ["log", "--format=%s", branch],
-        { cwd: repoRoot },
-      );
-      const messages = log.split("\n").reverse(); // oldest first
+      const { stdout: log } = await execa("git", ["log", "--format=%s", branch], { cwd: repoRoot });
+      const messages = log.split("\n").reverse();
       expect(messages).toEqual([
         "seed",
         "wip: start greeting",
@@ -154,7 +154,6 @@ describe("handoff e2e — walking skeleton", () => {
         "finish greeting",
       ]);
 
-      // Final file content should be what Agent B committed.
       const { stdout: blob } = await execa("git", ["show", `${branch}:greeting.txt`], {
         cwd: repoRoot,
       });
@@ -167,6 +166,8 @@ describe("handoff e2e — walking skeleton", () => {
     const agent = await orch.registerAgent({
       name: "solo",
       kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
       transport: "mcp-stdio",
     });
     const claim = await orch.claimNextTask(agent.id);
@@ -174,78 +175,95 @@ describe("handoff e2e — walking skeleton", () => {
   });
 
   it(
-    "review → bounce returns task to queue where any agent can reclaim",
+    "review -> bounce returns the task to the planner queue where another planner can reclaim it",
     async () => {
-      const agentA = await orch.registerAgent({
-        name: "A",
+      const plannerA = await orch.registerAgent({
+        name: "planner-a",
         kind: "mock",
+        role: "planner",
+        runtimeMode: "external",
         transport: "mcp-stdio",
       });
-      const agentB = await orch.registerAgent({
-        name: "B",
+      const plannerB = await orch.registerAgent({
+        name: "planner-b",
         kind: "mock",
+        role: "planner",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const executor = await orch.registerAgent({
+        name: "executor",
+        kind: "mock",
+        role: "executor",
+        runtimeMode: "external",
         transport: "mcp-stdio",
       });
 
       const task = await orch.createTask({ title: "To bounce" });
-      orch.applyEvent(task.id, { kind: "ready" });
 
-      const claimedByA = await orch.claimNextTask(agentA.id);
-      expect(claimedByA?.id).toBe(task.id);
-      const branchName = claimedByA!.branch_name!;
+      const claimedPlanning = await orch.claimNextTask(plannerA.id);
+      expect(claimedPlanning?.id).toBe(task.id);
+      await orch.publishPlan(task.id, plannerA.id, "Initial plan");
 
-      const mockA = new MockAgent(agentA.id, orch);
-      await mockA.workOn(claimedByA!, [
+      const claimedExec = await orch.claimNextTask(executor.id);
+      expect(claimedExec?.id).toBe(task.id);
+      const branchName = claimedExec!.branch_name!;
+
+      const mockExecutor = new MockAgent(executor.id, orch);
+      await mockExecutor.workOn(claimedExec!, [
         { kind: "commit", file: "x.txt", content: "first attempt", message: "first attempt" },
         { kind: "submit" },
       ]);
       expect(orch.getTask(task.id).status).toBe("review");
 
-      // Human bounces: send back to the queue for another attempt.
-      orch.applyEvent(task.id, { kind: "bounce", note: "needs more work" });
+      await orch.reviewDecision(task.id, { decision: "bounce", note: "needs more work" });
       const bounced = orch.getTask(task.id);
       expect(bounced.status).toBe("todo");
-      // Without clearing the assignee, the task would be invisible to claimNextTask
-      // (which filters on assigned_agent_id IS NULL) and stuck forever.
       expect(bounced.assigned_agent_id).toBeNull();
-      // Branch preserved so A's commits survive the retry.
       expect(bounced.branch_name).toBe(branchName);
 
-      // A different agent picks it up and resumes the same branch.
-      const claimedByB = await orch.claimNextTask(agentB.id);
-      expect(claimedByB?.id).toBe(task.id);
-      expect(claimedByB?.status).toBe("in_progress");
-      expect(claimedByB?.assigned_agent_id).toBe(agentB.id);
-      expect(claimedByB?.branch_name).toBe(branchName);
-      expect(claimedByB?.worktree_path).toBeTruthy();
-      expect(existsSync(claimedByB!.worktree_path!)).toBe(true);
+      const reclaimed = await orch.claimNextTask(plannerB.id);
+      expect(reclaimed?.id).toBe(task.id);
+      expect(reclaimed?.status).toBe("planning");
+      expect(reclaimed?.assigned_agent_id).toBe(plannerB.id);
+      expect(reclaimed?.branch_name).toBe(branchName);
+      expect(reclaimed?.worktree_path).toBeTruthy();
+      expect(existsSync(reclaimed!.worktree_path!)).toBe(true);
     },
     15_000,
   );
 
-  it("handoff_pending tasks rank ahead of fresh todos", async () => {
-    const a = await orch.registerAgent({ name: "A", kind: "mock", transport: "mcp-stdio" });
-    const b = await orch.registerAgent({ name: "B", kind: "mock", transport: "mcp-stdio" });
+  it("planning tasks rank ahead of fresh todos for planners", async () => {
+    const plannerA = await orch.registerAgent({
+      name: "planner-a",
+      kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const plannerB = await orch.registerAgent({
+      name: "planner-b",
+      kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
 
     const old = await orch.createTask({ title: "old", priority: 50 });
-    orch.applyEvent(old.id, { kind: "ready" });
-
-    // Agent A claims old, makes a commit, then hits a limit — old becomes handoff_pending.
-    const oldClaim = await orch.claimNextTask(a.id);
-    const mockA = new MockAgent(a.id, orch);
+    const oldClaim = await orch.claimNextTask(plannerA.id);
+    expect(oldClaim?.id).toBe(old.id);
+    const mockA = new MockAgent(plannerA.id, orch);
     await mockA.workOn(oldClaim!, [
-      { kind: "commit", file: "a.txt", content: "x", message: "wip" },
+      { kind: "scratchpad", content: "Need to finish the plan" },
       { kind: "limit", reason: "context_limit" },
     ]);
-    expect(orch.getTask(old.id).status).toBe("handoff_pending");
+    expect(orch.getTask(old.id).status).toBe("planning");
 
-    // A higher-priority fresh task arrives.
     const fresh = await orch.createTask({ title: "fresh", priority: 90 });
-    orch.applyEvent(fresh.id, { kind: "ready" });
+    expect(fresh.status).toBe("todo");
 
-    // Agent B should pick up the handoff even though fresh has higher priority —
-    // in-flight work wins over new work to keep the pipeline moving.
-    const nextForB = await orch.claimNextTask(b.id);
+    const nextForB = await orch.claimNextTask(plannerB.id);
     expect(nextForB?.id).toBe(old.id);
+    expect(nextForB?.status).toBe("planning");
   });
 });

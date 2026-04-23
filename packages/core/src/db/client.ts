@@ -19,6 +19,7 @@ export interface OpenDatabaseResult {
 
 const MIGRATIONS: ReadonlyArray<{ version: number; file: string }> = [
   { version: 1, file: "migrations/0000_init.sql" },
+  { version: 2, file: "migrations/0001_autonomous_pipeline.sql" },
 ];
 
 export function openDatabase(dbPath: string): OpenDatabaseResult {

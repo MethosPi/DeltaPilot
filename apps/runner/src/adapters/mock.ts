@@ -1,7 +1,7 @@
 import type { AdapterContext, AdapterResult, AgentAdapter } from "../adapters.js";
 
 export interface MockAdapterOptions {
-  result: AdapterResult;
+  result: AdapterResult | ((ctx: AdapterContext) => AdapterResult | Promise<AdapterResult>);
   onExecute?: (ctx: AdapterContext) => void | Promise<void>;
 }
 
@@ -11,6 +11,8 @@ export class MockAdapter implements AgentAdapter {
 
   async execute(ctx: AdapterContext): Promise<AdapterResult> {
     if (this.options.onExecute) await this.options.onExecute(ctx);
-    return this.options.result;
+    return typeof this.options.result === "function"
+      ? await this.options.result(ctx)
+      : this.options.result;
   }
 }

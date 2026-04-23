@@ -13,6 +13,10 @@ describe("adapter registry", () => {
     expect(getAdapter("mock")).toBe(mock);
   });
 
+  it("returns the built-in codex adapter when none is registered", () => {
+    expect(getAdapter("codex").kind).toBe("codex");
+  });
+
   it("throws on unknown kind", () => {
     expect(() => getAdapter("nonexistent-kind")).toThrow(/no adapter/i);
   });

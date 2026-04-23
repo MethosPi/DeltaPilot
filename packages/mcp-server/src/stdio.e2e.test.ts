@@ -23,30 +23,101 @@ async function makeRepo(): Promise<string> {
   return dir;
 }
 
-async function seedAgentAndReadyTask(
+async function registerAgent(
   repoRoot: string,
   dbPath: string,
-): Promise<{ agentId: string; taskId: string }> {
+  role: "planner" | "executor" | "reviewer",
+): Promise<string> {
   const conn = openDatabase(dbPath);
   try {
-    const worktreeMgr = new WorktreeManager({
-      repoRoot,
-      workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
-    });
     const orch = new Orchestrator({
       raw: conn.raw,
       db: conn.db,
-      worktreeMgr,
+      worktreeMgr: new WorktreeManager({
+        repoRoot,
+        workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
+      }),
       repoRoot,
     });
     const agent = await orch.registerAgent({
-      name: "test-agent",
+      name: `${role}-agent`,
       kind: "mock",
+      role,
+      runtimeMode: "external",
       transport: "mcp-stdio",
     });
+    return agent.id;
+  } finally {
+    conn.close();
+  }
+}
+
+async function createPlannableTask(repoRoot: string, dbPath: string): Promise<string> {
+  const conn = openDatabase(dbPath);
+  try {
+    const orch = new Orchestrator({
+      raw: conn.raw,
+      db: conn.db,
+      worktreeMgr: new WorktreeManager({
+        repoRoot,
+        workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
+      }),
+      repoRoot,
+    });
     const task = await orch.createTask({ title: "stdio round-trip" });
-    orch.applyEvent(task.id, { kind: "ready" });
-    return { agentId: agent.id, taskId: task.id };
+    return task.id;
+  } finally {
+    conn.close();
+  }
+}
+
+async function promoteTaskToExecution(
+  repoRoot: string,
+  dbPath: string,
+  plannerId: string,
+  taskId: string,
+): Promise<void> {
+  const conn = openDatabase(dbPath);
+  try {
+    const orch = new Orchestrator({
+      raw: conn.raw,
+      db: conn.db,
+      worktreeMgr: new WorktreeManager({
+        repoRoot,
+        workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
+      }),
+      repoRoot,
+    });
+    const claimed = await orch.claimNextTask(plannerId);
+    expect(claimed?.id).toBe(taskId);
+    await orch.publishPlan(taskId, plannerId, "Do the thing");
+  } finally {
+    conn.close();
+  }
+}
+
+async function promoteTaskToReview(
+  repoRoot: string,
+  dbPath: string,
+  plannerId: string,
+  executorId: string,
+  taskId: string,
+): Promise<void> {
+  await promoteTaskToExecution(repoRoot, dbPath, plannerId, taskId);
+  const conn = openDatabase(dbPath);
+  try {
+    const orch = new Orchestrator({
+      raw: conn.raw,
+      db: conn.db,
+      worktreeMgr: new WorktreeManager({
+        repoRoot,
+        workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
+      }),
+      repoRoot,
+    });
+    const claimed = await orch.claimNextTask(executorId);
+    expect(claimed?.id).toBe(taskId);
+    await orch.submitWork(taskId, executorId);
   } finally {
     conn.close();
   }
@@ -61,58 +132,99 @@ function parseJson<T>(result: unknown): T {
   return JSON.parse(first.text) as T;
 }
 
+async function connectClient(repoRoot: string, agentId: string): Promise<{ client: Client; transport: StdioClientTransport }> {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [CLI_PATH, "--repo", repoRoot, "--agent-id", agentId],
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "test-client", version: "0.0.0" });
+  await client.connect(transport);
+  return { client, transport };
+}
+
 describe("deltapilot-mcp stdio CLI — e2e", () => {
   let repoRoot: string;
   let dbPath: string;
-  let agentId: string;
-  let taskId: string;
-  let client: Client;
-  let transport: StdioClientTransport;
 
   beforeEach(async () => {
     repoRoot = await makeRepo();
     dbPath = path.join(repoRoot, ".deltapilot-data.db");
-    ({ agentId, taskId } = await seedAgentAndReadyTask(repoRoot, dbPath));
-
-    transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [CLI_PATH, "--repo", repoRoot, "--agent-id", agentId],
-      stderr: "pipe",
-    });
-    client = new Client({ name: "test-client", version: "0.0.0" });
-    await client.connect(transport);
   });
 
   afterEach(async () => {
-    await client.close();
     await rm(repoRoot, { recursive: true, force: true });
   });
 
-  it("advertises all 5 orchestrator tools", async () => {
-    const { tools } = await client.listTools();
-    const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual([
-      "claim_task",
-      "heartbeat",
-      "report_limit",
-      "request_handoff",
-      "submit_work",
-    ]);
+  it("advertises the autonomous pipeline tools", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const { client } = await connectClient(repoRoot, plannerId);
+    try {
+      const { tools } = await client.listTools();
+      const names = tools.map((t) => t.name).sort();
+      expect(names).toEqual([
+        "claim_task",
+        "create_task",
+        "heartbeat",
+        "publish_plan",
+        "report_limit",
+        "request_handoff",
+        "submit_review",
+        "submit_work",
+      ]);
+    } finally {
+      await client.close();
+    }
   });
 
-  it(
-    "claim_task → heartbeat → submit_work drives the task to review without agent_id in any call",
-    async () => {
+  it("planner create_task -> claim_task -> publish_plan drives the task into executor queue", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const { client } = await connectClient(repoRoot, plannerId);
+    try {
+      const createdResult = await client.callTool({
+        name: "create_task",
+        arguments: { title: "new task", brief: "created over MCP", priority: 75 },
+      });
+      const created = parseJson<{ id: string; status: string }>(createdResult);
+      expect(created.status).toBe("todo");
+
+      const claimResult = await client.callTool({ name: "claim_task", arguments: {} });
+      const claimed = parseJson<{ id: string; status: string; assigned_agent_id: string } | null>(
+        claimResult,
+      );
+      expect(claimed?.id).toBe(created.id);
+      expect(claimed?.status).toBe("planning");
+      expect(claimed?.assigned_agent_id).toBe(plannerId);
+
+      const planResult = await client.callTool({
+        name: "publish_plan",
+        arguments: { task_id: created.id, plan: "1. inspect\n2. implement\n3. verify" },
+      });
+      const planned = parseJson<{ status: string; assigned_agent_id: string | null }>(planResult);
+      expect(planned.status).toBe("in_progress");
+      expect(planned.assigned_agent_id).toBeNull();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("executor claim_task -> heartbeat -> submit_work drives the task to review", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const executorId = await registerAgent(repoRoot, dbPath, "executor");
+    const taskId = await createPlannableTask(repoRoot, dbPath);
+    await promoteTaskToExecution(repoRoot, dbPath, plannerId, taskId);
+
+    const { client } = await connectClient(repoRoot, executorId);
+    try {
       const claimResult = await client.callTool({ name: "claim_task", arguments: {} });
       const claimed = parseJson<{
         id: string;
         status: string;
         assigned_agent_id: string;
       } | null>(claimResult);
-      expect(claimed).not.toBeNull();
-      expect(claimed!.id).toBe(taskId);
-      expect(claimed!.status).toBe("in_progress");
-      expect(claimed!.assigned_agent_id).toBe(agentId);
+      expect(claimed?.id).toBe(taskId);
+      expect(claimed?.status).toBe("in_progress");
+      expect(claimed?.assigned_agent_id).toBe(executorId);
 
       await client.callTool({
         name: "heartbeat",
@@ -123,10 +235,12 @@ describe("deltapilot-mcp stdio CLI — e2e", () => {
         name: "submit_work",
         arguments: { task_id: taskId },
       });
-      const submitted = parseJson<{ id: string; status: string }>(submitResult);
+      const submitted = parseJson<{ id: string; status: string; assigned_agent_id: string | null }>(
+        submitResult,
+      );
       expect(submitted.status).toBe("review");
+      expect(submitted.assigned_agent_id).toBeNull();
 
-      // Verify state persisted to the shared DB.
       await client.close();
       const conn: OpenDatabaseResult = openDatabase(dbPath);
       try {
@@ -137,46 +251,82 @@ describe("deltapilot-mcp stdio CLI — e2e", () => {
       } finally {
         conn.close();
       }
-    },
-    20_000,
-  );
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }, 20_000);
 
-  it(
-    "report_limit moves the claimed task to handoff_pending and removes the worktree",
-    async () => {
+  it("reviewer claim_task -> submit_review approve drives the task to done", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const executorId = await registerAgent(repoRoot, dbPath, "executor");
+    const reviewerId = await registerAgent(repoRoot, dbPath, "reviewer");
+    const taskId = await createPlannableTask(repoRoot, dbPath);
+    await promoteTaskToReview(repoRoot, dbPath, plannerId, executorId, taskId);
+
+    const { client } = await connectClient(repoRoot, reviewerId);
+    try {
+      const claimResult = await client.callTool({ name: "claim_task", arguments: {} });
+      const claimed = parseJson<{ id: string; status: string; assigned_agent_id: string } | null>(
+        claimResult,
+      );
+      expect(claimed?.status).toBe("review");
+      expect(claimed?.assigned_agent_id).toBe(reviewerId);
+
+      const reviewResult = await client.callTool({
+        name: "submit_review",
+        arguments: { task_id: taskId, decision: "approve", note: "Looks good" },
+      });
+      const reviewed = parseJson<{ status: string }>(reviewResult);
+      expect(reviewed.status).toBe("done");
+    } finally {
+      await client.close();
+    }
+  }, 20_000);
+
+  it("report_limit keeps the task in the same phase and clears the assignee/worktree", async () => {
+    const plannerId = await registerAgent(repoRoot, dbPath, "planner");
+    const executorId = await registerAgent(repoRoot, dbPath, "executor");
+    const taskId = await createPlannableTask(repoRoot, dbPath);
+    await promoteTaskToExecution(repoRoot, dbPath, plannerId, taskId);
+
+    const { client } = await connectClient(repoRoot, executorId);
+    try {
       await client.callTool({ name: "claim_task", arguments: {} });
       await client.callTool({
         name: "report_limit",
         arguments: { task_id: taskId, reason: "rate_limit" },
       });
-
+    } finally {
       await client.close();
-      const conn = openDatabase(dbPath);
-      try {
-        const row = conn.raw
-          .prepare(
-            "SELECT status, assigned_agent_id, worktree_path FROM tasks WHERE id = ?",
-          )
-          .get(taskId) as {
-          status: string;
-          assigned_agent_id: string | null;
-          worktree_path: string | null;
-        };
-        expect(row.status).toBe("handoff_pending");
-        expect(row.assigned_agent_id).toBeNull();
-        expect(row.worktree_path).toBeNull();
-      } finally {
-        conn.close();
-      }
-    },
-    20_000,
-  );
+    }
 
-  it("claim_task returns null when the queue is empty", async () => {
-    // Drain the seeded task first.
-    await client.callTool({ name: "claim_task", arguments: {} });
-    const again = await client.callTool({ name: "claim_task", arguments: {} });
-    const parsed = parseJson<null>(again);
-    expect(parsed).toBeNull();
+    const conn = openDatabase(dbPath);
+    try {
+      const row = conn.raw
+        .prepare("SELECT status, assigned_agent_id, worktree_path FROM tasks WHERE id = ?")
+        .get(taskId) as {
+        status: string;
+        assigned_agent_id: string | null;
+        worktree_path: string | null;
+      };
+      expect(row.status).toBe("in_progress");
+      expect(row.assigned_agent_id).toBeNull();
+      expect(row.worktree_path).toBeNull();
+    } finally {
+      conn.close();
+    }
+  }, 20_000);
+
+  it("claim_task returns null when there is no compatible work for the role", async () => {
+    const executorId = await registerAgent(repoRoot, dbPath, "executor");
+    await createPlannableTask(repoRoot, dbPath);
+    const { client } = await connectClient(repoRoot, executorId);
+    try {
+      const again = await client.callTool({ name: "claim_task", arguments: {} });
+      const parsed = parseJson<null>(again);
+      expect(parsed).toBeNull();
+    } finally {
+      await client.close();
+    }
   });
 });

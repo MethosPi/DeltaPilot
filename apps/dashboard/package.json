@@ -24,7 +24,8 @@
   "dependencies": {
     "@deltapilot/core": "workspace:*",
     "@deltapilot/shared": "workspace:*",
-    "better-sqlite3": "^11.8.1"
+    "better-sqlite3": "^11.8.1",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",

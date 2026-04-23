@@ -32,14 +32,25 @@ async function seed(
       workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
     });
     const orch = new Orchestrator({ raw: conn.raw, db: conn.db, worktreeMgr, repoRoot });
-    const agent = await orch.registerAgent({
+    const planner = await orch.registerAgent({
+      name: "planner-agent",
+      kind: "mock",
+      role: "planner",
+      runtimeMode: "external",
+      transport: "mcp-stdio",
+    });
+    const executor = await orch.registerAgent({
       name: "sdk-agent",
       kind: "mock",
+      role: "executor",
+      runtimeMode: "external",
       transport: "mcp-stdio",
     });
     const task = await orch.createTask({ title: "sdk e2e" });
-    orch.applyEvent(task.id, { kind: "ready" });
-    return { agentId: agent.id, taskId: task.id };
+    const planned = await orch.claimNextTask(planner.id);
+    expect(planned?.status).toBe("planning");
+    await orch.publishPlan(task.id, planner.id, "Ship the change");
+    return { agentId: executor.id, taskId: task.id };
   } finally {
     conn.close();
   }
@@ -68,7 +79,7 @@ describe("DeltaPilotClient — subprocess e2e", () => {
   });
 
   it(
-    "claimTask → submitWork drives the task to review",
+    "claimTask -> submitWork drives the executor phase to review",
     async () => {
       const claimed = await client.claimTask();
       expect(claimed?.id).toBe(taskId);
@@ -81,13 +92,10 @@ describe("DeltaPilotClient — subprocess e2e", () => {
   );
 
   it(
-    "withAutoHandoff wires a synthetic 429 into a real handoff_pending on the orchestrator",
+    "withAutoHandoff wires a synthetic 429 into a real requeue on the orchestrator",
     async () => {
       await client.claimTask();
 
-      // Note: the throw happens before any commit, so worktree snapshot/artifact
-      // capture on handoff is NOT exercised here — orchestrator-layer tests
-      // cover that. This test only proves the SDK → MCP → reportLimit wire.
       const fake429 = Object.assign(new Error("rate_limit_exceeded"), { status: 429 });
       await expect(
         withAutoHandoff(
@@ -114,7 +122,7 @@ describe("DeltaPilotClient — subprocess e2e", () => {
           assigned_agent_id: string | null;
           worktree_path: string | null;
         };
-        expect(row.status).toBe("handoff_pending");
+        expect(row.status).toBe("in_progress");
         expect(row.assigned_agent_id).toBeNull();
         expect(row.worktree_path).toBeNull();
       } finally {
@@ -125,13 +133,14 @@ describe("DeltaPilotClient — subprocess e2e", () => {
   );
 
   it(
-    "second SDK-driven agent claims the handoff_pending task and drives it to review",
+    "second SDK-driven executor claims the requeued task and drives it to review",
     async () => {
-      // Agent A hits the limit and hands off via the SDK.
       await client.claimTask();
       const fake429 = Object.assign(new Error("429"), { status: 429 });
       await expect(
-        withAutoHandoff(async () => { throw fake429; }, {
+        withAutoHandoff(async () => {
+          throw fake429;
+        }, {
           client,
           taskId,
           isLimit: (e) => ((e as { status?: number }).status === 429 ? "rate_limit" : null),
@@ -139,7 +148,6 @@ describe("DeltaPilotClient — subprocess e2e", () => {
       ).rejects.toBe(fake429);
       await client.close();
 
-      // Register agent B directly on the shared DB.
       const conn = openDatabase(dbPath);
       let agentBId: string;
       try {
@@ -151,6 +159,8 @@ describe("DeltaPilotClient — subprocess e2e", () => {
         const agentB = await orch.registerAgent({
           name: "sdk-agent-b",
           kind: "mock",
+          role: "executor",
+          runtimeMode: "external",
           transport: "mcp-stdio",
         });
         agentBId = agentB.id;
@@ -158,7 +168,6 @@ describe("DeltaPilotClient — subprocess e2e", () => {
         conn.close();
       }
 
-      // Agent B connects via the SDK, claims the handoff_pending task, submits.
       const clientB = await DeltaPilotClient.connect({
         command: process.execPath,
         args: [CLI_PATH, "--repo", repoRoot, "--agent-id", agentBId],

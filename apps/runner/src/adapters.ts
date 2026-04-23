@@ -1,4 +1,6 @@
-import type { Task } from "@deltapilot/shared";
+import type { Agent, AgentRole, ApprovalRequestKind, Task } from "@deltapilot/shared";
+import type { Orchestrator } from "@deltapilot/core";
+import { createCodexAdapter } from "./adapters/codex.js";
 
 export interface AdapterContext {
   task: Task;
@@ -6,11 +8,20 @@ export interface AdapterContext {
   repoRoot: string;
   signal: AbortSignal;
   log: (line: string) => void;
+  agent?: Agent;
+  agentRole?: AgentRole;
+  sessionId?: string;
+  orchestrator?: Orchestrator;
 }
 
 export interface AdapterResult {
-  kind: "ok" | "error" | "rate_limit" | "context_limit";
+  kind: "ok" | "error" | "rate_limit" | "context_limit" | "approval" | "question";
   message?: string;
+  output?: string;
+  decision?: "approve" | "bounce";
+  approvalTitle?: string;
+  approvalBody?: string;
+  approvalKind?: ApprovalRequestKind;
 }
 
 export interface AgentAdapter {
@@ -21,13 +32,20 @@ export interface AgentAdapter {
 type Factory = () => AgentAdapter;
 
 const registry = new Map<string, Factory>();
+const builtinRegistry = new Map<string, Factory>([
+  ["codex", createCodexAdapter],
+]);
 
 export function registerAdapter(kind: string, factory: Factory): void {
   registry.set(kind, factory);
 }
 
+export function hasAdapter(kind: string): boolean {
+  return registry.has(kind) || builtinRegistry.has(kind);
+}
+
 export function getAdapter(kind: string): AgentAdapter {
-  const factory = registry.get(kind);
+  const factory = registry.get(kind) ?? builtinRegistry.get(kind);
   if (!factory) throw new Error(`no adapter registered for kind "${kind}"`);
   return factory();
 }

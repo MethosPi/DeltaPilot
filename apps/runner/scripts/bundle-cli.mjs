@@ -15,10 +15,9 @@ await build({
   format: "esm",
   target: "node22",
   outfile: path.join(appRoot, "dist/cli.js"),
-  external: ["better-sqlite3", "node-pty"],
+  external: ["better-sqlite3"],
   banner: {
     js: [
-      "#!/usr/bin/env node",
       'import { createRequire as __nodeCreateRequire } from "node:module";',
       "const require = __nodeCreateRequire(import.meta.url);",
     ].join("\n"),

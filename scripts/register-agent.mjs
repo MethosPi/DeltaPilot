@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Register a DeltaPilot agent in the local SQLite DB.
 // Usage:
-//   node scripts/register-agent.mjs --name <name> --kind <kind> [--repo <path>] [--transport <t>]
+//   node scripts/register-agent.mjs --name <name> --kind <kind> --role <role> [--repo <path>] [--transport <t>] [--runtime-mode <mode>]
 //
-// kind: claude-code | claude-sdk | codex | opendevin | hermes | mock | other
+// kind: claude-code | claude-sdk | openclaw | codex | opendevin | hermes | mock | other
+// role: planner | executor | reviewer
+// runtime-mode (default external): managed | external
 // transport (default mcp-stdio): mcp-stdio | http
 //
 // Prints the generated agent UUID to stdout, one "KEY=VALUE" line per field.
@@ -22,7 +24,9 @@ const { values } = parseArgs({
   options: {
     name: { type: "string" },
     kind: { type: "string" },
+    role: { type: "string", default: "executor" },
     repo: { type: "string", default: repoRootDefault },
+    "runtime-mode": { type: "string", default: "external" },
     transport: { type: "string", default: "mcp-stdio" },
     db: { type: "string" },
   },
@@ -30,15 +34,25 @@ const { values } = parseArgs({
 });
 
 if (!values.name || !values.kind) {
-  console.error("usage: register-agent.mjs --name <name> --kind <kind> [--repo <path>] [--transport <t>] [--db <path>]");
+  console.error("usage: register-agent.mjs --name <name> --kind <kind> --role <role> [--repo <path>] [--transport <t>] [--runtime-mode <mode>] [--db <path>]");
   process.exit(2);
 }
 
-const VALID_KINDS = ["claude-code", "claude-sdk", "codex", "opendevin", "hermes", "mock", "other"];
+const VALID_KINDS = ["claude-code", "claude-sdk", "openclaw", "codex", "opendevin", "hermes", "mock", "other"];
+const VALID_ROLES = ["planner", "executor", "reviewer"];
+const VALID_RUNTIME_MODES = ["managed", "external"];
 const VALID_TRANSPORTS = ["mcp-stdio", "http"];
 
 if (!VALID_KINDS.includes(values.kind)) {
   console.error(`kind must be one of: ${VALID_KINDS.join(", ")}`);
+  process.exit(2);
+}
+if (!VALID_ROLES.includes(values.role)) {
+  console.error(`role must be one of: ${VALID_ROLES.join(", ")}`);
+  process.exit(2);
+}
+if (!VALID_RUNTIME_MODES.includes(values["runtime-mode"])) {
+  console.error(`runtime-mode must be one of: ${VALID_RUNTIME_MODES.join(", ")}`);
   process.exit(2);
 }
 if (!VALID_TRANSPORTS.includes(values.transport)) {
@@ -71,11 +85,16 @@ try {
   const id = randomUUID();
   const now = new Date().toISOString();
   db.prepare(
-    "INSERT INTO agents (id, name, kind, transport, command, endpoint, registered_at, last_seen_at) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)",
-  ).run(id, values.name, values.kind, values.transport, now);
+    `INSERT INTO agents
+     (id, name, kind, role, runtime_mode, transport, enabled, command, endpoint,
+      registered_at, last_seen_at, cooldown_until, last_limit_reason)
+     VALUES (?, ?, ?, ?, ?, ?, 1, NULL, NULL, ?, NULL, NULL, NULL)`,
+  ).run(id, values.name, values.kind, values.role, values["runtime-mode"], values.transport, now);
   console.log(`AGENT_ID=${id}`);
   console.log(`NAME=${values.name}`);
   console.log(`KIND=${values.kind}`);
+  console.log(`ROLE=${values.role}`);
+  console.log(`RUNTIME_MODE=${values["runtime-mode"]}`);
   console.log(`TRANSPORT=${values.transport}`);
   console.log(`REGISTERED_AT=${now}`);
 } finally {

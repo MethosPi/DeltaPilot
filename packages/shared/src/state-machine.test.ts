@@ -1,56 +1,50 @@
-import { describe, it, expect } from "vitest";
-import { nextStatus, canTransition, allowedEvents, InvalidTransitionError } from "./state-machine.js";
+import { describe, expect, it } from "vitest";
+import { allowedEvents, canTransition, InvalidTransitionError, nextStatus } from "./state-machine.js";
 import type { TaskEvent, TaskStatus } from "./schemas.js";
 
 const agentId = "11111111-1111-1111-1111-111111111111";
 
-describe("state machine — golden path", () => {
-  it("walks init → todo → in_progress → review → done", () => {
-    let s: TaskStatus = "init";
-    s = nextStatus(s, { kind: "ready" });
-    expect(s).toBe("todo");
-    s = nextStatus(s, { kind: "claim", agent_id: agentId });
+describe("state machine — planner/executor/reviewer flow", () => {
+  it("walks todo -> planning -> in_progress -> review -> done", () => {
+    let s: TaskStatus = "todo";
+    s = nextStatus(s, { kind: "start_planning", agent_id: agentId });
+    expect(s).toBe("planning");
+    s = nextStatus(s, { kind: "plan_ready" });
     expect(s).toBe("in_progress");
-    s = nextStatus(s, { kind: "submit_for_review" });
+    s = nextStatus(s, { kind: "start_execution", agent_id: agentId });
+    expect(s).toBe("in_progress");
+    s = nextStatus(s, { kind: "execution_ready" });
     expect(s).toBe("review");
-    s = nextStatus(s, { kind: "approve" });
+    s = nextStatus(s, { kind: "review_decision", decision: "approve" });
     expect(s).toBe("done");
   });
 });
 
-describe("state machine — handoff path", () => {
-  it("moves in_progress → handoff_pending on report_limit then back to in_progress on claim", () => {
-    let s: TaskStatus = "in_progress";
-    s = nextStatus(s, { kind: "report_limit", reason: "rate_limit" });
-    expect(s).toBe("handoff_pending");
-    s = nextStatus(s, { kind: "claim", agent_id: agentId });
-    expect(s).toBe("in_progress");
+describe("state machine — retries and escalation", () => {
+  it("keeps a planning handoff in planning", () => {
+    expect(nextStatus("planning", { kind: "report_limit", reason: "rate_limit" })).toBe("planning");
   });
 
-  it("treats heartbeat timeout the same as report_limit for routing", () => {
-    const s = nextStatus("in_progress", { kind: "timeout" });
-    expect(s).toBe("handoff_pending");
+  it("returns bounced review tasks to todo", () => {
+    expect(nextStatus("review", { kind: "review_decision", decision: "bounce", note: "missing tests" })).toBe("todo");
   });
-});
 
-describe("state machine — review bounce", () => {
-  it("returns bounced task to todo so any agent can reclaim", () => {
-    const s = nextStatus("review", { kind: "bounce", note: "missing tests" });
-    expect(s).toBe("todo");
+  it("allows human_review -> todo reset", () => {
+    expect(nextStatus("human_review", { kind: "return_to_todo", note: "approved retry" })).toBe("todo");
   });
 });
 
 describe("state machine — terminal states", () => {
   it.each<TaskStatus>(["done", "cancelled"])("%s accepts no further events", (terminal) => {
     expect(allowedEvents(terminal)).toHaveLength(0);
-    expect(() => nextStatus(terminal, { kind: "claim", agent_id: agentId })).toThrow(
+    expect(() => nextStatus(terminal, { kind: "start_execution", agent_id: agentId })).toThrow(
       InvalidTransitionError,
     );
   });
 });
 
 describe("state machine — cancellation", () => {
-  it.each<TaskStatus>(["init", "todo", "in_progress", "handoff_pending", "review"])(
+  it.each<TaskStatus>(["todo", "planning", "in_progress", "review", "human_review"])(
     "cancels from non-terminal %s",
     (from) => {
       expect(nextStatus(from, { kind: "cancel" })).toBe("cancelled");
@@ -59,32 +53,28 @@ describe("state machine — cancellation", () => {
 });
 
 describe("state machine — invalid transitions", () => {
-  it("rejects claim from init", () => {
-    expect(() => nextStatus("init", { kind: "claim", agent_id: agentId })).toThrow(
+  it("rejects execution_ready from planning", () => {
+    expect(() => nextStatus("planning", { kind: "execution_ready" })).toThrow(
       InvalidTransitionError,
     );
   });
 
-  it("rejects approve from in_progress", () => {
-    expect(() => nextStatus("in_progress", { kind: "approve" })).toThrow(InvalidTransitionError);
-  });
-
-  it("rejects submit_for_review from handoff_pending", () => {
-    expect(() => nextStatus("handoff_pending", { kind: "submit_for_review" })).toThrow(
+  it("rejects review_decision from in_progress", () => {
+    expect(() => nextStatus("in_progress", { kind: "review_decision", decision: "approve" })).toThrow(
       InvalidTransitionError,
     );
   });
 
-  it("canTransition returns false for forbidden event", () => {
-    expect(canTransition("todo", "approve")).toBe(false);
-    expect(canTransition("todo", "claim")).toBe(true);
+  it("canTransition reflects review decision routing", () => {
+    expect(canTransition("todo", "review_decision")).toBe(false);
+    expect(canTransition("review", "review_decision")).toBe(true);
   });
 });
 
-describe("state machine — event payload surface", () => {
-  it("carries metadata through but doesn't affect transition", () => {
+describe("state machine — legacy compatibility events", () => {
+  it("still accepts legacy claim + submit_for_review", () => {
     const claim: TaskEvent = { kind: "claim", agent_id: agentId };
-    expect(nextStatus("todo", claim)).toBe("in_progress");
-    expect(nextStatus("handoff_pending", claim)).toBe("in_progress");
+    expect(nextStatus("todo", claim)).toBe("planning");
+    expect(nextStatus("in_progress", { kind: "submit_for_review" })).toBe("review");
   });
 });

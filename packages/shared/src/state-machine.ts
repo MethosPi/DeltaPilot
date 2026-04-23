@@ -1,4 +1,4 @@
-import type { TaskEvent, TaskStatus } from "./schemas.js";
+import type { ReviewDecision, TaskEvent, TaskStatus } from "./schemas.js";
 
 export class InvalidTransitionError extends Error {
   constructor(
@@ -10,38 +10,57 @@ export class InvalidTransitionError extends Error {
   }
 }
 
-type Transition = Partial<Record<TaskEvent["kind"], TaskStatus>>;
+type StaticEventKind = Exclude<TaskEvent["kind"], "review_decision">;
+type Transition = Partial<Record<StaticEventKind, TaskStatus>>;
 
-const TRANSITIONS: Record<TaskStatus, Transition> = {
-  init: {
-    ready: "todo",
-    cancel: "cancelled",
-  },
+const STATIC_TRANSITIONS: Record<TaskStatus, Transition> = {
   todo: {
-    claim: "in_progress",
+    start_planning: "planning",
+    cancel: "cancelled",
+    claim: "planning",
+  },
+  planning: {
+    start_planning: "planning",
+    plan_ready: "in_progress",
+    report_limit: "planning",
     cancel: "cancelled",
   },
   in_progress: {
+    start_execution: "in_progress",
+    execution_ready: "review",
+    report_limit: "in_progress",
     submit_for_review: "review",
-    report_limit: "handoff_pending",
-    timeout: "handoff_pending",
-    cancel: "cancelled",
-  },
-  handoff_pending: {
-    claim: "in_progress",
     cancel: "cancelled",
   },
   review: {
+    start_review: "review",
+    enter_human_review: "human_review",
+    report_limit: "review",
     approve: "done",
     bounce: "todo",
+    cancel: "cancelled",
+  },
+  human_review: {
+    return_to_todo: "todo",
     cancel: "cancelled",
   },
   done: {},
   cancelled: {},
 };
 
+function reviewDecisionTarget(decision: ReviewDecision): TaskStatus {
+  return decision === "approve" ? "done" : "todo";
+}
+
 export function nextStatus(current: TaskStatus, event: TaskEvent): TaskStatus {
-  const candidate = TRANSITIONS[current][event.kind];
+  if (event.kind === "review_decision") {
+    if (current !== "review") {
+      throw new InvalidTransitionError(current, event.kind);
+    }
+    return reviewDecisionTarget(event.decision);
+  }
+
+  const candidate = STATIC_TRANSITIONS[current][event.kind as StaticEventKind];
   if (!candidate) {
     throw new InvalidTransitionError(current, event.kind);
   }
@@ -49,9 +68,16 @@ export function nextStatus(current: TaskStatus, event: TaskEvent): TaskStatus {
 }
 
 export function canTransition(current: TaskStatus, event: TaskEvent["kind"]): boolean {
-  return TRANSITIONS[current][event] !== undefined;
+  if (event === "review_decision") {
+    return current === "review";
+  }
+  return STATIC_TRANSITIONS[current][event as StaticEventKind] !== undefined;
 }
 
 export function allowedEvents(current: TaskStatus): ReadonlyArray<TaskEvent["kind"]> {
-  return Object.keys(TRANSITIONS[current]) as TaskEvent["kind"][];
+  const base = Object.keys(STATIC_TRANSITIONS[current]) as TaskEvent["kind"][];
+  if (current === "review") {
+    return [...base, "review_decision"];
+  }
+  return base;
 }

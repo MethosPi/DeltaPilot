@@ -1,42 +1,66 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { Orchestrator, WorktreeManager, openDatabase, type OpenDatabaseResult } from "@deltapilot/core";
-import type { AcceptanceCriteria, Agent, Task, TaskStatus } from "@deltapilot/shared";
+import { promisify } from "node:util";
+import {
+  AgentDeleteConflictError,
+  AgentNotFoundError,
+  Orchestrator,
+  WorktreeManager,
+  openDatabase,
+  type OpenDatabaseResult,
+} from "@deltapilot/core";
+import type {
+  AcceptanceCriteria,
+  Agent,
+  AgentRole,
+  AgentRuntimeMode,
+  AgentSession,
+  ApprovalRequest,
+  SessionMessage,
+  Task,
+  TaskStatus,
+} from "@deltapilot/shared";
+import { spawn as spawnPty, type IPty } from "node-pty";
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = existsSync(path.join(__dirname, "public"))
   ? path.join(__dirname, "public")
   : path.resolve(__dirname, "../public");
 const MAX_BODY_SIZE = 1024 * 1024;
-type DashboardBoardStatus = "todo" | "in_progress" | "review" | "done" | "cancelled";
 
 const TASK_STATUS_ORDER: TaskStatus[] = [
-  "init",
   "todo",
-  "handoff_pending",
+  "planning",
   "in_progress",
   "review",
-  "done",
-  "cancelled",
-];
-const BOARD_STATUS_ORDER: DashboardBoardStatus[] = [
-  "todo",
-  "in_progress",
-  "review",
+  "human_review",
   "done",
   "cancelled",
 ];
 
-const STATUS_RANK = new Map(TASK_STATUS_ORDER.map((status, index) => [status, index]));
 const MIME_TYPES = new Map<string, string>([
   [".html", "text/html; charset=utf-8"],
   [".js", "application/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
 ]);
+
+const MANAGED_COMMAND_DEFAULTS: Partial<Record<Agent["kind"], string>> = {
+  codex: "codex",
+  "claude-code": "claude",
+  "claude-sdk": "claude",
+  openclaw: "openclaw gateway start",
+  opendevin: "opendevin",
+  hermes: "hermes",
+};
+
+const TERMINAL_RELAUNCH_COMMANDS = new Set(["claude", "codex", "openclaw gateway start"]);
 
 interface TaskRow {
   id: string;
@@ -48,6 +72,9 @@ interface TaskRow {
   branch_name: string | null;
   worktree_path: string | null;
   acceptance_json: string | null;
+  review_bounce_count: number;
+  last_role: string | null;
+  status_note: string | null;
   created_at: string;
   updated_at: string;
   claimed_at: string | null;
@@ -58,11 +85,16 @@ interface AgentRow {
   id: string;
   name: string;
   kind: Agent["kind"];
+  role: Agent["role"];
+  runtime_mode: Agent["runtime_mode"];
   transport: Agent["transport"];
+  enabled: number;
   command: string | null;
   endpoint: string | null;
   registered_at: string;
   last_seen_at: string | null;
+  cooldown_until: string | null;
+  last_limit_reason: string | null;
 }
 
 interface TaskEventRow {
@@ -101,6 +133,54 @@ interface HandoffRow {
   completed_at: string | null;
 }
 
+interface SessionRow {
+  id: string;
+  agent_id: string;
+  task_id: string | null;
+  status: AgentSession["status"];
+  pid: number | null;
+  log_path: string;
+  started_at: string;
+  ended_at: string | null;
+  last_seen_at: string | null;
+  last_error: string | null;
+  agent_name: string;
+  agent_kind: Agent["kind"];
+  agent_role: AgentRole;
+  transport: Agent["transport"];
+  runtime_mode: AgentRuntimeMode;
+  command: string | null;
+  endpoint: string | null;
+  task_title: string | null;
+  pending_approval_count: number;
+}
+
+interface ApprovalRow {
+  id: string;
+  session_id: string;
+  task_id: string | null;
+  agent_id: string;
+  kind: ApprovalRequest["kind"];
+  status: ApprovalRequest["status"];
+  title: string;
+  body: string;
+  response_note: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  agent_name: string;
+  task_title: string | null;
+}
+
+interface MessageRow {
+  id: string;
+  session_id: string;
+  approval_request_id: string | null;
+  direction: SessionMessage["direction"];
+  kind: string;
+  body: string;
+  created_at: string;
+}
+
 export interface DashboardServerOptions {
   repoRoot: string;
   dbPath: string;
@@ -120,13 +200,11 @@ export interface StartedDashboardServer {
   server: HttpServer;
 }
 
-interface DashboardTaskSummary {
+export interface DashboardTaskSummary {
   id: string;
   title: string;
   brief: string;
-  status: DashboardBoardStatus;
-  raw_status: TaskStatus;
-  status_note: string | null;
+  status: TaskStatus;
   priority: number;
   assigned_agent_id: string | null;
   assigned_agent_name: string | null;
@@ -134,17 +212,22 @@ interface DashboardTaskSummary {
   worktree_path: string | null;
   worktree_exists: boolean;
   acceptance: AcceptanceCriteria | null;
+  review_bounce_count: number;
+  last_role: AgentRole | null;
+  status_note: string | null;
   created_at: string;
   updated_at: string;
   claimed_at: string | null;
   last_heartbeat_at: string | null;
 }
 
-interface DashboardAgentSummary extends Agent {
+export interface DashboardAgentSummary extends Agent {
   assigned_task_count: number;
+  pending_approval_count: number;
+  active_session_id: string | null;
 }
 
-interface DashboardTaskEvent {
+export interface DashboardTaskEvent {
   id: string;
   kind: string;
   payload: Record<string, unknown> | null;
@@ -155,7 +238,7 @@ interface DashboardTaskEvent {
   created_at: string;
 }
 
-interface DashboardArtifact {
+export interface DashboardArtifact {
   id: string;
   kind: string;
   path: string;
@@ -165,7 +248,7 @@ interface DashboardArtifact {
   content: string | null;
 }
 
-interface DashboardHandoff {
+export interface DashboardHandoff {
   id: string;
   task_id: string;
   task_title: string;
@@ -179,29 +262,80 @@ interface DashboardHandoff {
   completed_at: string | null;
 }
 
-interface DashboardTaskDetail {
+export interface DashboardTaskDetail {
   task: DashboardTaskSummary;
   events: DashboardTaskEvent[];
   artifacts: DashboardArtifact[];
   handoffs: DashboardHandoff[];
 }
 
-interface DashboardSnapshot {
+export interface DashboardSessionSummary {
+  id: string;
+  agent_id: string;
+  agent_name: string;
+  agent_kind: Agent["kind"];
+  agent_role: AgentRole;
+  transport: Agent["transport"];
+  runtime_mode: AgentRuntimeMode;
+  command: string | null;
+  endpoint: string | null;
+  task_id: string | null;
+  task_title: string | null;
+  status: AgentSession["status"];
+  pid: number | null;
+  log_path: string;
+  started_at: string;
+  ended_at: string | null;
+  last_seen_at: string | null;
+  last_error: string | null;
+  pending_approval_count: number;
+}
+
+export interface DashboardApprovalSummary {
+  id: string;
+  session_id: string;
+  task_id: string | null;
+  agent_id: string;
+  agent_name: string;
+  task_title: string | null;
+  kind: ApprovalRequest["kind"];
+  status: ApprovalRequest["status"];
+  title: string;
+  body: string;
+  response_note: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface DashboardSessionDetail {
+  session: DashboardSessionSummary;
+  messages: SessionMessage[];
+  approvals: DashboardApprovalSummary[];
+  log_content: string;
+}
+
+export interface DashboardSnapshot {
   meta: {
     repo_root: string;
     db_path: string;
     generated_at: string;
   };
-  stats: Record<DashboardBoardStatus, number>;
+  stats: Record<TaskStatus, number>;
   tasks: DashboardTaskSummary[];
   agents: DashboardAgentSummary[];
+  sessions: DashboardSessionSummary[];
   recent_handoffs: DashboardHandoff[];
 }
+
+type InteractiveHandle =
+  | { kind: "pty"; pty: IPty }
+  | { kind: "screen"; sessionName: string };
 
 interface DashboardContext {
   conn: OpenDatabaseResult;
   orch: Orchestrator;
   worktreeMgr: WorktreeManager;
+  interactiveProcesses: Map<string, InteractiveHandle>;
   options: Required<Pick<DashboardServerOptions, "repoRoot" | "dbPath">> & {
     auth?: DashboardServerOptions["auth"];
   };
@@ -238,6 +372,7 @@ export async function startDashboardServer(
     conn,
     orch,
     worktreeMgr,
+    interactiveProcesses: new Map(),
     options: {
       repoRoot,
       dbPath,
@@ -288,6 +423,18 @@ export async function startDashboardServer(
     origin,
     server,
     close: async () => {
+      for (const handle of context.interactiveProcesses.values()) {
+        try {
+          if (handle.kind === "pty") {
+            handle.pty.kill("SIGINT");
+          } else {
+            await stopScreenSession(handle.sessionName);
+          }
+        } catch {
+          // best-effort shutdown
+        }
+      }
+      context.interactiveProcesses.clear();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
           if (error) reject(error);
@@ -325,11 +472,48 @@ async function handleRequest(
     return;
   }
 
+  if (method === "GET" && pathname === "/api/agents") {
+    sendJson(res, 200, selectAgents(context.conn.raw));
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/sessions") {
+    sendJson(res, 200, selectSessions(context.conn.raw, { managedOnly: true }));
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/sessions/clear-history") {
+    const deletedCount = await clearSessionHistory(context);
+    sendJson(res, 200, { deleted_count: deletedCount });
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/approvals") {
+    sendJson(res, 200, selectApprovals(context.conn.raw));
+    return;
+  }
+
   const taskMatch = pathname.match(/^\/api\/tasks\/([0-9a-f-]+)$/i);
   if (method === "GET" && taskMatch) {
     const taskId = taskMatch[1];
     if (!taskId) throw new HttpError(400, "task id is required");
     sendJson(res, 200, await loadTaskDetail(context, taskId));
+    return;
+  }
+
+  const sessionMatch = pathname.match(/^\/api\/sessions\/([0-9a-f-]+)$/i);
+  if (method === "GET" && sessionMatch) {
+    const sessionId = sessionMatch[1];
+    if (!sessionId) throw new HttpError(400, "session id is required");
+    sendJson(res, 200, await loadSessionDetail(context, sessionId));
+    return;
+  }
+
+  if (method === "DELETE" && sessionMatch) {
+    const sessionId = sessionMatch[1];
+    if (!sessionId) throw new HttpError(400, "session id is required");
+    const deleted = await deleteSessionById(context, sessionId);
+    sendJson(res, 200, deleted);
     return;
   }
 
@@ -347,6 +531,25 @@ async function handleRequest(
     return;
   }
 
+  const agentPatchMatch = pathname.match(/^\/api\/agents\/([0-9a-f-]+)$/i);
+  if (method === "PATCH" && agentPatchMatch) {
+    const agentId = agentPatchMatch[1];
+    if (!agentId) throw new HttpError(400, "agent id is required");
+    const body = await readJsonBody(req);
+    const agent = updateAgentFromBody(context, agentId, body);
+    sendJson(res, 200, agent);
+    return;
+  }
+
+  const agentDeleteMatch = pathname.match(/^\/api\/agents\/([0-9a-f-]+)$/i);
+  if (method === "DELETE" && agentDeleteMatch) {
+    const agentId = agentDeleteMatch[1];
+    if (!agentId) throw new HttpError(400, "agent id is required");
+    const agent = deleteAgentById(context, agentId);
+    sendJson(res, 200, agent);
+    return;
+  }
+
   const actionMatch = pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/actions$/i);
   if (method === "POST" && actionMatch) {
     const taskId = actionMatch[1];
@@ -354,6 +557,136 @@ async function handleRequest(
     const body = await readJsonBody(req);
     await applyDashboardAction(context, taskId, body);
     sendJson(res, 200, await loadTaskDetail(context, taskId));
+    return;
+  }
+
+  const returnMatch = pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/return-to-todo$/i);
+  if (method === "POST" && returnMatch) {
+    const taskId = returnMatch[1];
+    if (!taskId) throw new HttpError(400, "task id is required");
+    const body = await readJsonBody(req);
+    const note = typeof (body as { note?: unknown }).note === "string"
+      ? ((body as { note?: string }).note ?? "").trim()
+      : "";
+    await context.orch.returnToTodo(taskId, note || undefined);
+    sendJson(res, 200, await loadTaskDetail(context, taskId));
+    return;
+  }
+
+  const sessionMessageMatch = pathname.match(/^\/api\/sessions\/([0-9a-f-]+)\/messages$/i);
+  if (method === "POST" && sessionMessageMatch) {
+    const sessionId = sessionMessageMatch[1];
+    if (!sessionId) throw new HttpError(400, "session id is required");
+    const body = await readJsonBody(req);
+    const parsed = body as { body?: unknown; kind?: unknown };
+    const kind = typeof parsed.kind === "string" && parsed.kind.trim() ? parsed.kind.trim() : "message";
+    const rawMessage = typeof parsed.body === "string" ? parsed.body : "";
+    const message = rawMessage.trim();
+    const sendEnter = kind === "enter";
+    if (!sendEnter && !message) throw new HttpError(400, "message body is required");
+
+    const session = context.orch.getAgentSession(sessionId);
+    const agent = context.orch.getAgent(session.agent_id);
+    const interactive = context.interactiveProcesses.get(sessionId);
+    const launchCommand = resolveLaunchCommand(agent, message);
+
+    context.orch.createSessionMessage({
+      sessionId,
+      direction: "human",
+      kind: sendEnter ? "terminal_key" : (launchCommand ? "terminal_command" : kind),
+      body: sendEnter ? "[enter]" : message,
+    });
+
+    if (interactive) {
+      if (interactive.kind === "pty") {
+        interactive.pty.write(sendEnter ? "\r" : `${rawMessage}\r`);
+      } else {
+        if (!(await screenSessionExists(interactive.sessionName))) {
+          context.interactiveProcesses.delete(sessionId);
+          throw new HttpError(409, "interactive terminal is no longer running; relaunch it first");
+        }
+        await sendScreenInput(interactive.sessionName, sendEnter ? "\r" : `${rawMessage}\r`);
+        await syncScreenTranscript(context, sessionId, interactive.sessionName);
+      }
+      await writeSessionLog(context, sessionId, sendEnter ? "[human/stdin] [enter]" : `[human/stdin] ${message}`);
+    } else if (launchCommand) {
+      await startInteractiveTerminal(context, sessionId, launchCommand);
+    } else if (sendEnter) {
+      throw new HttpError(409, "no interactive terminal is running for this session");
+    } else if (agent.runtime_mode === "managed") {
+      await respondToManagedAgentMessage(context, session, agent, message);
+      if (session.status === "waiting") {
+        context.orch.updateAgentSession(sessionId, {
+          status: "ready",
+          lastSeenAt: new Date().toISOString(),
+        });
+      }
+    } else if (session.status === "waiting") {
+      context.orch.updateAgentSession(sessionId, { status: "ready" });
+    }
+
+    sendJson(res, 201, await loadSessionDetail(context, sessionId));
+    return;
+  }
+
+  const interruptMatch = pathname.match(/^\/api\/sessions\/([0-9a-f-]+)\/interrupt$/i);
+  if (method === "POST" && interruptMatch) {
+    const sessionId = interruptMatch[1];
+    if (!sessionId) throw new HttpError(400, "session id is required");
+    await interruptSession(context, sessionId);
+    sendJson(res, 200, await loadSessionDetail(context, sessionId));
+    return;
+  }
+
+  const approveMatch = pathname.match(/^\/api\/approvals\/([0-9a-f-]+)\/approve$/i);
+  if (method === "POST" && approveMatch) {
+    const approvalId = approveMatch[1];
+    if (!approvalId) throw new HttpError(400, "approval id is required");
+    const body = await readJsonBody(req);
+    const note = typeof (body as { note?: unknown }).note === "string"
+      ? ((body as { note?: string }).note ?? "").trim()
+      : "";
+    const approval = context.orch.resolveApprovalRequest(approvalId, "approved", note || undefined);
+    context.orch.createSessionMessage({
+      sessionId: approval.session_id,
+      approvalRequestId: approvalId,
+      direction: "human",
+      kind: "approval",
+      body: note || "Approved",
+    });
+    if (context.orch.listApprovalRequests({ status: "pending", sessionId: approval.session_id }).length === 0) {
+      const session = context.orch.getAgentSession(approval.session_id);
+      if (session.status === "waiting") {
+        context.orch.updateAgentSession(approval.session_id, { status: "ready" });
+      }
+    }
+    sendJson(res, 200, approval);
+    return;
+  }
+
+  const rejectMatch = pathname.match(/^\/api\/approvals\/([0-9a-f-]+)\/reject$/i);
+  if (method === "POST" && rejectMatch) {
+    const approvalId = rejectMatch[1];
+    if (!approvalId) throw new HttpError(400, "approval id is required");
+    const body = await readJsonBody(req);
+    const note = typeof (body as { note?: unknown }).note === "string"
+      ? ((body as { note?: string }).note ?? "").trim()
+      : "";
+    const approval = context.orch.resolveApprovalRequest(approvalId, "rejected", note || undefined);
+    context.orch.createSessionMessage({
+      sessionId: approval.session_id,
+      approvalRequestId: approvalId,
+      direction: "human",
+      kind: "rejection",
+      body: note || "Rejected",
+    });
+    if (context.orch.listApprovalRequests({ status: "pending", sessionId: approval.session_id }).length === 0) {
+      const session = context.orch.getAgentSession(approval.session_id);
+      if (session.status === "waiting") {
+        context.orch.updateAgentSession(approval.session_id, { status: "ready" });
+      }
+    }
+    sendJson(res, 200, approval);
     return;
   }
 
@@ -424,11 +757,12 @@ function isAuthorized(
 function loadDashboardSnapshot(context: DashboardContext): DashboardSnapshot {
   const tasks = selectTasks(context.conn.raw);
   const agents = selectAgents(context.conn.raw);
-  const recentHandoffs = selectHandoffs(context.conn.raw);
+  const sessions = selectSessions(context.conn.raw, { managedOnly: true });
+  const recentHandoffs = selectHandoffs(context.conn.raw).slice(0, 12);
 
   const stats = Object.fromEntries(
-    BOARD_STATUS_ORDER.map((status) => [status, 0]),
-  ) as Record<DashboardBoardStatus, number>;
+    TASK_STATUS_ORDER.map((status) => [status, 0]),
+  ) as Record<TaskStatus, number>;
   for (const task of tasks) {
     stats[task.status] = (stats[task.status] ?? 0) + 1;
   }
@@ -442,7 +776,8 @@ function loadDashboardSnapshot(context: DashboardContext): DashboardSnapshot {
     stats,
     tasks,
     agents,
-    recent_handoffs: recentHandoffs.slice(0, 12),
+    sessions,
+    recent_handoffs: recentHandoffs,
   };
 }
 
@@ -451,15 +786,49 @@ async function loadTaskDetail(
   taskId: string,
 ): Promise<DashboardTaskDetail> {
   const task = selectTaskById(context.conn.raw, taskId);
-  if (!task) {
-    throw new HttpError(404, `Task not found: ${taskId}`);
-  }
-
+  if (!task) throw new HttpError(404, `Task not found: ${taskId}`);
   return {
     task,
     events: selectTaskEvents(context.conn.raw, taskId),
     handoffs: selectHandoffs(context.conn.raw, taskId),
     artifacts: await selectArtifacts(context.conn.raw, taskId),
+  };
+}
+
+async function loadSessionDetail(
+  context: DashboardContext,
+  sessionId: string,
+): Promise<DashboardSessionDetail> {
+  const session = selectSessionById(context.conn.raw, sessionId);
+  if (!session) throw new HttpError(404, `Session not found: ${sessionId}`);
+  const interactive = context.interactiveProcesses.get(sessionId);
+  let screenSnapshot = "";
+  if (interactive?.kind === "screen") {
+    if (await screenSessionExists(interactive.sessionName)) {
+      screenSnapshot = await syncScreenTranscript(context, sessionId, interactive.sessionName);
+    } else {
+      context.interactiveProcesses.delete(sessionId);
+      context.orch.updateAgentSession(sessionId, {
+        status: "stopped",
+        pid: null,
+      });
+    }
+  }
+  const messages = context.orch.listSessionMessages(sessionId);
+  const approvals = selectApprovals(context.conn.raw, { sessionId });
+  let logContent = "";
+  if (existsSync(session.log_path)) {
+    const raw = await readFile(session.log_path, "utf8");
+    logContent = raw.slice(-24_000);
+  }
+  if (screenSnapshot) {
+    logContent = [logContent, "\n# terminal\n", screenSnapshot].filter(Boolean).join("");
+  }
+  return {
+    session,
+    messages,
+    approvals,
+    log_content: logContent,
   };
 }
 
@@ -471,44 +840,23 @@ async function createTaskFromBody(
     title?: unknown;
     brief?: unknown;
     priority?: unknown;
-    ready?: unknown;
     acceptance?: unknown;
   };
 
   const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
-  if (!title) {
-    throw new HttpError(400, "title is required");
-  }
+  if (!title) throw new HttpError(400, "title is required");
 
   const brief = typeof parsed.brief === "string" ? parsed.brief.trim() : "";
   const priority = parsePriority(parsed.priority);
   const acceptance = parseAcceptance(parsed.acceptance);
-  const ready = parsed.ready === undefined ? true : Boolean(parsed.ready);
 
-  const created = await context.orch.createTask({
+  return context.orch.createTask({
     title,
     brief,
-    priority,
+    ...(priority !== undefined ? { priority } : {}),
     ...(acceptance ? { acceptance } : {}),
   });
-
-  if (ready) {
-    return context.orch.applyEvent(created.id, { kind: "ready" });
-  }
-
-  return created;
 }
-
-const VALID_AGENT_KINDS: Agent["kind"][] = [
-  "claude-code",
-  "claude-sdk",
-  "codex",
-  "opendevin",
-  "hermes",
-  "mock",
-  "other",
-];
-const VALID_AGENT_TRANSPORTS: Agent["transport"][] = ["mcp-stdio", "http"];
 
 async function registerAgentFromBody(
   context: DashboardContext,
@@ -517,37 +865,108 @@ async function registerAgentFromBody(
   const parsed = body as {
     name?: unknown;
     kind?: unknown;
+    role?: unknown;
+    runtime_mode?: unknown;
     transport?: unknown;
+    enabled?: unknown;
     command?: unknown;
     endpoint?: unknown;
   };
 
   const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
-  if (!name) {
-    throw new HttpError(400, "name is required");
+  if (!name) throw new HttpError(400, "name is required");
+  if (typeof parsed.kind !== "string") throw new HttpError(400, "kind is required");
+  if (typeof parsed.role !== "string") throw new HttpError(400, "role is required");
+
+  const runtimeMode =
+    typeof parsed.runtime_mode === "string" ? parsed.runtime_mode : "managed";
+  const transport =
+    typeof parsed.transport === "string" ? parsed.transport : "mcp-stdio";
+  const enabled = parsed.enabled === undefined ? true : Boolean(parsed.enabled);
+  const command = typeof parsed.command === "string" && parsed.command.trim()
+    ? parsed.command.trim()
+    : resolveManagedCommandDefault(
+        typeof parsed.kind === "string" ? parsed.kind as Agent["kind"] : "other",
+        runtimeMode as AgentRuntimeMode,
+      );
+  const endpoint = typeof parsed.endpoint === "string" && parsed.endpoint.trim()
+    ? parsed.endpoint.trim()
+    : undefined;
+
+  try {
+    return await context.orch.registerAgent({
+      name,
+      kind: parsed.kind as Agent["kind"],
+      role: parsed.role as Agent["role"],
+      runtimeMode: runtimeMode as AgentRuntimeMode,
+      transport: transport as Agent["transport"],
+      enabled,
+      ...(command ? { command } : {}),
+      ...(endpoint ? { endpoint } : {}),
+    });
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
   }
+}
 
-  if (typeof parsed.kind !== "string" || !VALID_AGENT_KINDS.includes(parsed.kind as Agent["kind"])) {
-    throw new HttpError(400, `kind must be one of: ${VALID_AGENT_KINDS.join(", ")}`);
+function updateAgentFromBody(
+  context: DashboardContext,
+  agentId: string,
+  body: unknown,
+): Agent {
+  const parsed = body as {
+    name?: unknown;
+    role?: unknown;
+    runtime_mode?: unknown;
+    enabled?: unknown;
+    command?: unknown;
+    endpoint?: unknown;
+    cooldown_until?: unknown;
+  };
+
+  try {
+    return context.orch.updateAgent(agentId, {
+      ...(typeof parsed.name === "string" ? { name: parsed.name.trim() } : {}),
+      ...(typeof parsed.role === "string" ? { role: parsed.role as Agent["role"] } : {}),
+      ...(typeof parsed.runtime_mode === "string"
+        ? { runtimeMode: parsed.runtime_mode as AgentRuntimeMode }
+        : {}),
+      ...(parsed.enabled !== undefined ? { enabled: Boolean(parsed.enabled) } : {}),
+      ...(parsed.command !== undefined
+        ? { command: typeof parsed.command === "string" ? parsed.command.trim() || null : null }
+        : {}),
+      ...(parsed.endpoint !== undefined
+        ? { endpoint: typeof parsed.endpoint === "string" ? parsed.endpoint.trim() || null : null }
+        : {}),
+      ...(parsed.cooldown_until !== undefined
+        ? {
+            cooldownUntil:
+              typeof parsed.cooldown_until === "string" && parsed.cooldown_until.trim()
+                ? parsed.cooldown_until.trim()
+                : null,
+          }
+        : {}),
+    });
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
   }
-  const kind = parsed.kind as Agent["kind"];
+}
 
-  const transportRaw = typeof parsed.transport === "string" ? parsed.transport : "mcp-stdio";
-  if (!VALID_AGENT_TRANSPORTS.includes(transportRaw as Agent["transport"])) {
-    throw new HttpError(400, `transport must be one of: ${VALID_AGENT_TRANSPORTS.join(", ")}`);
+function deleteAgentById(
+  context: DashboardContext,
+  agentId: string,
+): Agent {
+  try {
+    return context.orch.deleteAgent(agentId);
+  } catch (error) {
+    if (error instanceof AgentNotFoundError) {
+      throw new HttpError(404, error.message);
+    }
+    if (error instanceof AgentDeleteConflictError) {
+      throw new HttpError(409, error.message);
+    }
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
   }
-  const transport = transportRaw as Agent["transport"];
-
-  const command = typeof parsed.command === "string" && parsed.command.trim() ? parsed.command.trim() : undefined;
-  const endpoint = typeof parsed.endpoint === "string" && parsed.endpoint.trim() ? parsed.endpoint.trim() : undefined;
-
-  return context.orch.registerAgent({
-    name,
-    kind,
-    transport,
-    ...(command ? { command } : {}),
-    ...(endpoint ? { endpoint } : {}),
-  });
 }
 
 async function applyDashboardAction(
@@ -565,31 +984,26 @@ async function applyDashboardAction(
       if (typeof parsed.target_status !== "string") {
         throw new HttpError(400, "move requires target_status");
       }
-      await moveTaskFromDashboard(
+      moveTaskFromDashboard(
         context,
         taskId,
-        parseBoardStatus(parsed.target_status),
+        parseTaskStatus(parsed.target_status),
         typeof parsed.note === "string" ? parsed.note.trim() : "",
       );
       return;
     }
-    case "ready":
-      context.orch.applyEvent(taskId, { kind: "ready" });
-      return;
     case "approve":
-      context.orch.applyEvent(taskId, { kind: "approve" });
-      return;
-    case "cancel":
-      context.orch.applyEvent(taskId, { kind: "cancel" });
+      await context.orch.reviewDecision(taskId, { decision: "approve" });
       return;
     case "bounce": {
       const note = typeof parsed.note === "string" ? parsed.note.trim() : "";
-      if (!note) {
-        throw new HttpError(400, "bounce requires a note");
-      }
-      context.orch.applyEvent(taskId, { kind: "bounce", note });
+      if (!note) throw new HttpError(400, "bounce requires a note");
+      await context.orch.reviewDecision(taskId, { decision: "bounce", note });
       return;
     }
+    case "cancel":
+      await context.orch.cancelTask(taskId);
+      return;
     default:
       throw new HttpError(400, `unsupported action kind: ${parsed.kind}`);
   }
@@ -607,10 +1021,8 @@ function parsePriority(raw: unknown): number | undefined {
   return parsed;
 }
 
-function parseBoardStatus(raw: string): DashboardBoardStatus {
-  if (BOARD_STATUS_ORDER.includes(raw as DashboardBoardStatus)) {
-    return raw as DashboardBoardStatus;
-  }
+function parseTaskStatus(raw: string): TaskStatus {
+  if (TASK_STATUS_ORDER.includes(raw as TaskStatus)) return raw as TaskStatus;
   throw new HttpError(400, `unsupported target status: ${raw}`);
 }
 
@@ -626,10 +1038,16 @@ function parseAcceptance(raw: unknown): AcceptanceCriteria | undefined {
 
   const goal = typeof candidate.goal === "string" ? candidate.goal.trim() : "";
   const deliverables = Array.isArray(candidate.deliverables)
-    ? candidate.deliverables.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean)
+    ? candidate.deliverables
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean)
     : [];
   const filesInScope = Array.isArray(candidate.files_in_scope)
-    ? candidate.files_in_scope.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean)
+    ? candidate.files_in_scope
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean)
     : [];
   const successTest =
     typeof candidate.success_test === "string" ? candidate.success_test.trim() : "";
@@ -653,108 +1071,49 @@ function parseAcceptance(raw: unknown): AcceptanceCriteria | undefined {
   };
 }
 
-async function moveTaskFromDashboard(
+function moveTaskFromDashboard(
   context: DashboardContext,
   taskId: string,
-  targetStatus: DashboardBoardStatus,
+  targetStatus: TaskStatus,
   note: string,
-): Promise<void> {
+): void {
   const task = selectTaskRowById(context.conn.raw, taskId);
-  if (!task) {
-    throw new HttpError(404, `Task not found: ${taskId}`);
-  }
-
-  const fromStatus = task.status as TaskStatus;
+  if (!task) throw new HttpError(404, `Task not found: ${taskId}`);
   const ts = new Date().toISOString();
+  context.conn.raw
+    .prepare(
+      `UPDATE tasks
+         SET status = ?,
+             assigned_agent_id = NULL,
+             worktree_path = NULL,
+             claimed_at = NULL,
+             last_heartbeat_at = NULL,
+             updated_at = ?,
+             status_note = ?
+       WHERE id = ?`,
+    )
+    .run(targetStatus, ts, note || null, taskId);
 
-  let assignedAgentId = task.assigned_agent_id;
-  let branchName = task.branch_name;
-  let worktreePath = task.worktree_path;
-  let claimedAt = task.claimed_at;
-  let lastHeartbeatAt = task.last_heartbeat_at;
-
-  if (targetStatus === "in_progress") {
-    assignedAgentId ??= selectPreferredAgentId(context.conn.raw);
-    if (!assignedAgentId) {
-      throw new HttpError(400, "move to in_progress requires at least one registered agent");
-    }
-    context.orch.getAgent(assignedAgentId);
-
-    const ensured = await ensureTaskWorktree(context, task);
-    branchName = ensured.branchName;
-    worktreePath = ensured.worktreePath;
-    claimedAt = ts;
-    lastHeartbeatAt = ts;
-  } else if (targetStatus === "todo" || targetStatus === "cancelled") {
-    assignedAgentId = null;
-    worktreePath = null;
-    claimedAt = null;
-    lastHeartbeatAt = null;
-  }
-
-  if (
-    fromStatus === targetStatus
-    && task.assigned_agent_id === assignedAgentId
-    && task.branch_name === branchName
-    && task.worktree_path === worktreePath
-  ) {
-    return;
-  }
-
-  const update = context.conn.raw.transaction(() => {
-    context.conn.raw
-      .prepare(
-        `UPDATE tasks
-           SET status = ?,
-               assigned_agent_id = ?,
-               branch_name = ?,
-               worktree_path = ?,
-               claimed_at = ?,
-               last_heartbeat_at = ?,
-               updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(
-        targetStatus,
-        assignedAgentId,
-        branchName,
-        worktreePath,
-        claimedAt,
-        lastHeartbeatAt,
-        ts,
-        taskId,
-      );
-
-    if (targetStatus === "in_progress" && assignedAgentId) {
-      context.conn.raw
-        .prepare("UPDATE agents SET last_seen_at = ? WHERE id = ?")
-        .run(ts, assignedAgentId);
-    }
-
-    context.conn.raw
-      .prepare(
-        `INSERT INTO task_events
-         (id, task_id, kind, payload_json, actor_agent_id, from_status, to_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        crypto.randomUUID(),
-        taskId,
-        "dashboard_move",
-        JSON.stringify({
-          note: note || null,
-          target_status: targetStatus,
-          assigned_agent_id: assignedAgentId,
-          mode: "dashboard_override",
-        }),
-        null,
-        fromStatus,
-        targetStatus,
-        ts,
-      );
-  });
-
-  update();
+  context.conn.raw
+    .prepare(
+      `INSERT INTO task_events
+       (id, task_id, kind, payload_json, actor_agent_id, from_status, to_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      crypto.randomUUID(),
+      taskId,
+      "dashboard_move",
+      JSON.stringify({
+        note: note || null,
+        target_status: targetStatus,
+        mode: "dashboard_override",
+      }),
+      null,
+      task.status,
+      targetStatus,
+      ts,
+    );
 }
 
 function selectTasks(raw: OpenDatabaseResult["raw"]): DashboardTaskSummary[] {
@@ -766,18 +1125,13 @@ function selectTasks(raw: OpenDatabaseResult["raw"]): DashboardTaskSummary[] {
       LEFT JOIN agents ON agents.id = tasks.assigned_agent_id
       ORDER BY
         CASE tasks.status
-          WHEN 'init' THEN 0
           WHEN 'todo' THEN 0
-          WHEN 'handoff_pending' THEN 1
-          WHEN 'in_progress' THEN 1
-          WHEN 'review' THEN 2
-          WHEN 'done' THEN 3
-          ELSE 4
-        END,
-        CASE tasks.status
-          WHEN 'todo' THEN 0
-          WHEN 'in_progress' THEN 0
-          ELSE 1
+          WHEN 'planning' THEN 1
+          WHEN 'in_progress' THEN 2
+          WHEN 'review' THEN 3
+          WHEN 'human_review' THEN 4
+          WHEN 'done' THEN 5
+          ELSE 6
         END,
         tasks.priority DESC,
         tasks.created_at ASC
@@ -795,7 +1149,6 @@ function selectTaskRowById(
   const row = raw
     .prepare("SELECT * FROM tasks WHERE id = ?")
     .get(taskId) as TaskRow | undefined;
-
   return row ?? null;
 }
 
@@ -821,25 +1174,41 @@ function selectAgents(raw: OpenDatabaseResult["raw"]): DashboardAgentSummary[] {
   const rows = raw
     .prepare(
       `
-      SELECT agents.*, COUNT(tasks.id) AS assigned_task_count
+      SELECT
+        agents.*,
+        COUNT(tasks.id) AS assigned_task_count,
+        (
+          SELECT COUNT(*)
+          FROM approval_requests
+          JOIN agent_sessions ON agent_sessions.id = approval_requests.session_id
+          WHERE approval_requests.status = 'pending'
+            AND agent_sessions.agent_id = agents.id
+        ) AS pending_approval_count,
+        (
+          SELECT id
+          FROM agent_sessions
+          WHERE agent_sessions.agent_id = agents.id
+            AND agent_sessions.ended_at IS NULL
+          ORDER BY agent_sessions.started_at DESC
+          LIMIT 1
+        ) AS active_session_id
       FROM agents
       LEFT JOIN tasks ON tasks.assigned_agent_id = agents.id
       GROUP BY agents.id
-      ORDER BY COALESCE(agents.last_seen_at, agents.registered_at) DESC, agents.name ASC
+      ORDER BY agents.role ASC, agents.name ASC
       `,
     )
-    .all() as Array<AgentRow & { assigned_task_count: number }>;
+    .all() as Array<AgentRow & {
+      assigned_task_count: number;
+      pending_approval_count: number;
+      active_session_id: string | null;
+    }>;
 
   return rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    kind: row.kind,
-    transport: row.transport,
-    ...(row.command !== null ? { command: row.command } : {}),
-    ...(row.endpoint !== null ? { endpoint: row.endpoint } : {}),
-    registered_at: row.registered_at,
-    last_seen_at: row.last_seen_at,
+    ...mapAgent(row),
     assigned_task_count: row.assigned_task_count,
+    pending_approval_count: row.pending_approval_count,
+    active_session_id: row.active_session_id,
   }));
 }
 
@@ -930,24 +1299,121 @@ function selectHandoffs(
   }));
 }
 
+function selectSessions(
+  raw: OpenDatabaseResult["raw"],
+  options: { managedOnly?: boolean } = {},
+): DashboardSessionSummary[] {
+  const rows = raw
+    .prepare(
+      `
+      SELECT
+        agent_sessions.*,
+        agents.name AS agent_name,
+        agents.kind AS agent_kind,
+        agents.role AS agent_role,
+        agents.transport AS transport,
+        agents.runtime_mode AS runtime_mode,
+        agents.command AS command,
+        agents.endpoint AS endpoint,
+        tasks.title AS task_title,
+        (
+          SELECT COUNT(*)
+          FROM approval_requests
+          WHERE approval_requests.session_id = agent_sessions.id
+            AND approval_requests.status = 'pending'
+        ) AS pending_approval_count
+      FROM agent_sessions
+      JOIN agents ON agents.id = agent_sessions.agent_id
+      LEFT JOIN tasks ON tasks.id = agent_sessions.task_id
+      ${options.managedOnly ? "WHERE agents.runtime_mode = 'managed'" : ""}
+      ORDER BY agent_sessions.started_at DESC
+      `,
+    )
+    .all() as SessionRow[];
+
+  return rows.map(mapSession);
+}
+
+function selectSessionById(
+  raw: OpenDatabaseResult["raw"],
+  sessionId: string,
+): DashboardSessionSummary | null {
+  const row = raw
+    .prepare(
+      `
+      SELECT
+        agent_sessions.*,
+        agents.name AS agent_name,
+        agents.kind AS agent_kind,
+        agents.role AS agent_role,
+        agents.transport AS transport,
+        agents.runtime_mode AS runtime_mode,
+        agents.command AS command,
+        agents.endpoint AS endpoint,
+        tasks.title AS task_title,
+        (
+          SELECT COUNT(*)
+          FROM approval_requests
+          WHERE approval_requests.session_id = agent_sessions.id
+            AND approval_requests.status = 'pending'
+        ) AS pending_approval_count
+      FROM agent_sessions
+      JOIN agents ON agents.id = agent_sessions.agent_id
+      LEFT JOIN tasks ON tasks.id = agent_sessions.task_id
+      WHERE agent_sessions.id = ?
+      `,
+    )
+    .get(sessionId) as SessionRow | undefined;
+
+  return row ? mapSession(row) : null;
+}
+
+function selectApprovals(
+  raw: OpenDatabaseResult["raw"],
+  filter?: { sessionId?: string },
+): DashboardApprovalSummary[] {
+  const sql = `
+    SELECT
+      approval_requests.*,
+      agents.name AS agent_name,
+      tasks.title AS task_title
+    FROM approval_requests
+    JOIN agents ON agents.id = approval_requests.agent_id
+    LEFT JOIN tasks ON tasks.id = approval_requests.task_id
+    ${filter?.sessionId ? "WHERE approval_requests.session_id = ?" : ""}
+    ORDER BY approval_requests.created_at DESC
+  `;
+  const rows = (filter?.sessionId
+    ? raw.prepare(sql).all(filter.sessionId)
+    : raw.prepare(sql).all()) as ApprovalRow[];
+  return rows.map((row) => ({
+    id: row.id,
+    session_id: row.session_id,
+    task_id: row.task_id,
+    agent_id: row.agent_id,
+    agent_name: row.agent_name,
+    task_title: row.task_title,
+    kind: row.kind,
+    status: row.status,
+    title: row.title,
+    body: row.body,
+    response_note: row.response_note,
+    created_at: row.created_at,
+    resolved_at: row.resolved_at,
+  }));
+}
+
 function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskSummary {
   const acceptance =
     row.acceptance_json !== null
       ? (JSON.parse(row.acceptance_json) as AcceptanceCriteria)
       : null;
 
-  const rawStatus = row.status as TaskStatus;
-  if (!STATUS_RANK.has(rawStatus)) {
-    throw new HttpError(500, `unknown task status: ${row.status}`);
-  }
-
   return {
     id: row.id,
     title: row.title,
     brief: row.brief,
-    status: toBoardStatus(rawStatus),
-    raw_status: rawStatus,
-    status_note: statusNoteFor(rawStatus),
+    status: row.status as TaskStatus,
     priority: row.priority,
     assigned_agent_id: row.assigned_agent_id,
     assigned_agent_name: assignedAgentName,
@@ -955,6 +1421,9 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
     worktree_path: row.worktree_path,
     worktree_exists: row.worktree_path ? existsSync(row.worktree_path) : false,
     acceptance,
+    review_bounce_count: row.review_bounce_count,
+    last_role: row.last_role as AgentRole | null,
+    status_note: row.status_note,
     created_at: row.created_at,
     updated_at: row.updated_at,
     claimed_at: row.claimed_at,
@@ -962,63 +1431,48 @@ function mapTask(row: TaskRow, assignedAgentName: string | null): DashboardTaskS
   };
 }
 
-function toBoardStatus(status: TaskStatus): DashboardBoardStatus {
-  switch (status) {
-    case "init":
-    case "todo":
-      return "todo";
-    case "handoff_pending":
-    case "in_progress":
-      return "in_progress";
-    case "review":
-    case "done":
-    case "cancelled":
-      return status;
-  }
+function mapAgent(row: AgentRow): Agent {
+  const agent: Agent = {
+    id: row.id,
+    name: row.name,
+    kind: row.kind,
+    role: row.role,
+    runtime_mode: row.runtime_mode,
+    transport: row.transport,
+    enabled: Boolean(row.enabled),
+    registered_at: row.registered_at,
+    last_seen_at: row.last_seen_at,
+    cooldown_until: row.cooldown_until,
+    last_limit_reason: row.last_limit_reason as Agent["last_limit_reason"],
+  };
+  const effectiveCommand = row.command ?? resolveManagedCommandDefault(row.kind, row.runtime_mode);
+  if (effectiveCommand !== undefined) agent.command = effectiveCommand;
+  if (row.endpoint !== null) agent.endpoint = row.endpoint;
+  return agent;
 }
 
-function statusNoteFor(status: TaskStatus): string | null {
-  switch (status) {
-    case "init":
-      return "Task created but not yet queued.";
-    case "handoff_pending":
-      return "Task is waiting to be reclaimed after a handoff.";
-    default:
-      return null;
-  }
-}
-
-function selectPreferredAgentId(raw: OpenDatabaseResult["raw"]): string | null {
-  const row = raw
-    .prepare(
-      `
-      SELECT id
-      FROM agents
-      ORDER BY COALESCE(last_seen_at, registered_at) DESC, registered_at DESC
-      LIMIT 1
-      `,
-    )
-    .get() as { id: string } | undefined;
-
-  return row?.id ?? null;
-}
-
-async function ensureTaskWorktree(
-  context: DashboardContext,
-  task: TaskRow,
-): Promise<{ branchName: string; worktreePath: string }> {
-  if (task.worktree_path && existsSync(task.worktree_path)) {
-    return {
-      branchName: task.branch_name ?? context.worktreeMgr.branchFor(task.id),
-      worktreePath: task.worktree_path,
-    };
-  }
-
-  if (task.branch_name) {
-    return context.worktreeMgr.attachWorktree(task.id);
-  }
-
-  return context.worktreeMgr.createWorktree(task.id);
+function mapSession(row: SessionRow): DashboardSessionSummary {
+  return {
+    id: row.id,
+    agent_id: row.agent_id,
+    agent_name: row.agent_name,
+    agent_kind: row.agent_kind,
+    agent_role: row.agent_role,
+    transport: row.transport,
+    runtime_mode: row.runtime_mode,
+    command: row.command ?? resolveManagedCommandDefault(row.agent_kind, row.runtime_mode) ?? null,
+    endpoint: row.endpoint,
+    task_id: row.task_id,
+    task_title: row.task_title,
+    status: row.status,
+    pid: row.pid,
+    log_path: row.log_path,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    last_seen_at: row.last_seen_at,
+    last_error: row.last_error,
+    pending_approval_count: row.pending_approval_count,
+  };
 }
 
 function safeParseJson(value: string | null): Record<string, unknown> | null {
@@ -1028,4 +1482,507 @@ function safeParseJson(value: string | null): Record<string, unknown> | null {
   } catch {
     return { raw: value };
   }
+}
+
+function resolveManagedCommandDefault(
+  kind: Agent["kind"],
+  runtimeMode: AgentRuntimeMode,
+): string | undefined {
+  if (runtimeMode !== "managed") return undefined;
+  return MANAGED_COMMAND_DEFAULTS[kind];
+}
+
+function resolveLaunchCommand(agent: Agent, body: string): string | null {
+  const command = body.trim();
+  if (!command) return null;
+  if (agent.command?.trim() === command) return command;
+  if (TERMINAL_RELAUNCH_COMMANDS.has(command)) return command;
+  return null;
+}
+
+async function interruptSession(
+  context: DashboardContext,
+  sessionId: string,
+): Promise<void> {
+  const session = context.orch.getAgentSession(sessionId);
+  context.orch.createSessionMessage({
+    sessionId,
+    direction: "human",
+    kind: "signal",
+    body: "^C",
+  });
+  await writeSessionLog(context, sessionId, "^C");
+
+  const child = context.interactiveProcesses.get(sessionId);
+  if (child) {
+    if (child.kind === "pty") {
+      child.pty.write("\u0003");
+      try {
+        child.pty.kill("SIGINT");
+      } catch {
+        // best-effort shutdown
+      }
+    } else {
+      if (!(await screenSessionExists(child.sessionName))) {
+        context.interactiveProcesses.delete(sessionId);
+        context.orch.updateAgentSession(sessionId, {
+          status: "stopped",
+          endedAt: new Date().toISOString(),
+          lastError: "Interrupted by user",
+        });
+        return;
+      }
+      await sendScreenInput(child.sessionName, "\u0003");
+      await stopScreenSession(child.sessionName);
+      context.interactiveProcesses.delete(sessionId);
+      context.orch.updateAgentSession(sessionId, {
+        status: "stopped",
+        endedAt: new Date().toISOString(),
+        pid: null,
+        lastError: "Interrupted by user",
+      });
+      return;
+    }
+    return;
+  }
+
+  if (session.pid !== null) {
+    try {
+      process.kill(session.pid, "SIGINT");
+      context.orch.updateAgentSession(sessionId, {
+        lastError: "Interrupted by user",
+      });
+      return;
+    } catch {
+      context.orch.updateAgentSession(sessionId, {
+        status: "stopped",
+        endedAt: new Date().toISOString(),
+        pid: null,
+        lastError: "Interrupted by user",
+      });
+      return;
+    }
+  }
+
+  context.orch.updateAgentSession(sessionId, {
+    status: "stopped",
+    endedAt: new Date().toISOString(),
+    lastError: "Interrupted by user",
+  });
+}
+
+async function startInteractiveTerminal(
+  context: DashboardContext,
+  sessionId: string,
+  command: string,
+): Promise<void> {
+  const session = context.orch.getAgentSession(sessionId);
+  const existing = context.interactiveProcesses.get(sessionId);
+  if (existing) {
+    if (existing.kind === "pty" || (await screenSessionExists(existing.sessionName))) {
+      throw new HttpError(409, "session already has a running interactive terminal");
+    }
+    context.interactiveProcesses.delete(sessionId);
+  }
+
+  if (session.pid !== null && isProcessAlive(session.pid)) {
+    throw new HttpError(409, "session already has a running process; interrupt it first");
+  }
+
+  const cwd = resolveSessionCwd(context, session);
+  await writeSessionLog(context, sessionId, `$ ${command}`);
+  const shell = resolveTerminalShell();
+  const env = buildTerminalEnv();
+
+  let child: IPty;
+  try {
+    child = spawnPty(shell, ["-lc", command], {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 32,
+      cwd,
+      env,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeSessionLog(context, sessionId, `interactive pty unavailable, falling back to screen: ${message}`);
+    await startScreenTerminal(context, sessionId, command, cwd, env);
+    return;
+  }
+  context.interactiveProcesses.set(sessionId, { kind: "pty", pty: child });
+
+  context.orch.updateAgentSession(sessionId, {
+    status: "busy",
+    pid: child.pid ?? null,
+    lastSeenAt: new Date().toISOString(),
+    lastError: null,
+  });
+
+  child.onData((data) => {
+    for (const line of data.split(/\r?\n/)) {
+      const trimmed = line.trimEnd();
+      if (!trimmed) continue;
+      void writeSessionLog(context, sessionId, `[interactive] ${trimmed}`);
+    }
+    context.orch.updateAgentSession(sessionId, {
+      lastSeenAt: new Date().toISOString(),
+    });
+  });
+
+  child.onExit(({ exitCode, signal }) => {
+    context.interactiveProcesses.delete(sessionId);
+    const reason = signal ? `signal ${signal}` : `exit ${exitCode}`;
+    void writeSessionLog(context, sessionId, `interactive process closed (${reason})`);
+    context.orch.updateAgentSession(sessionId, {
+      status: "stopped",
+      endedAt: new Date().toISOString(),
+      pid: null,
+      lastError:
+        signal === 2
+          ? "Interrupted by user"
+          : exitCode && exitCode !== 0
+            ? `Process exited with code ${exitCode}`
+            : null,
+    });
+  });
+}
+
+function resolveSessionCwd(context: DashboardContext, session: AgentSession): string {
+  if (session.task_id) {
+    try {
+      const task = context.orch.getTask(session.task_id);
+      if (task.worktree_path && existsSync(task.worktree_path)) return task.worktree_path;
+    } catch {
+      // ignore stale task references
+    }
+  }
+  return context.options.repoRoot;
+}
+
+async function writeSessionLog(
+  context: DashboardContext,
+  sessionId: string,
+  line: string,
+): Promise<void> {
+  const session = context.orch.getAgentSession(sessionId);
+  const stamped = `[${new Date().toISOString()}] ${line}\n`;
+  await mkdir(path.dirname(session.log_path), { recursive: true });
+  await appendFile(session.log_path, stamped, "utf8");
+  context.orch.updateAgentSession(sessionId, {
+    lastSeenAt: new Date().toISOString(),
+  });
+}
+
+async function deleteSessionById(
+  context: DashboardContext,
+  sessionId: string,
+): Promise<DashboardSessionSummary> {
+  const session = selectSessionById(context.conn.raw, sessionId);
+  if (!session) throw new HttpError(404, `Session not found: ${sessionId}`);
+
+  if (["busy", "waiting", "starting"].includes(session.status)) {
+    throw new HttpError(409, "interrupt or stop the session before removing it");
+  }
+
+  const interactive = context.interactiveProcesses.get(sessionId);
+  if (interactive) {
+    if (interactive.kind === "pty") {
+      try {
+        interactive.pty.kill("SIGINT");
+      } catch {
+        // best effort
+      }
+    } else {
+      try {
+        await stopScreenSession(interactive.sessionName);
+      } catch {
+        // best effort
+      }
+    }
+    context.interactiveProcesses.delete(sessionId);
+  }
+
+  await removeSessionArtifacts(session.log_path);
+  context.conn.raw.prepare("DELETE FROM agent_sessions WHERE id = ?").run(sessionId);
+  return session;
+}
+
+async function clearSessionHistory(context: DashboardContext): Promise<number> {
+  const sessions = selectSessions(context.conn.raw, { managedOnly: true }).filter((session) =>
+    ["stopped", "errored"].includes(session.status)
+  );
+
+  for (const session of sessions) {
+    await removeSessionArtifacts(session.log_path);
+  }
+
+  const info = context.conn.raw
+    .prepare("DELETE FROM agent_sessions WHERE status IN ('stopped', 'errored')")
+    .run();
+  return info.changes;
+}
+
+async function removeSessionArtifacts(logPath: string): Promise<void> {
+  await Promise.allSettled([
+    rm(logPath, { force: true }),
+    rm(`${logPath}.screen`, { force: true }),
+  ]);
+}
+
+async function respondToManagedAgentMessage(
+  context: DashboardContext,
+  session: AgentSession,
+  agent: Agent,
+  message: string,
+): Promise<void> {
+  const task = await resolveSessionContextTask(context, session);
+  const plan = task ? await context.orch.readArtifact(task.id, "execution_plan") : null;
+  const reviewReport = task ? await context.orch.readArtifact(task.id, "review_report") : null;
+
+  let reply = buildContextualFallbackReply(message, task, plan, reviewReport);
+
+  if (!reply && agent.kind === "codex") {
+    reply = await tryCodexAgentReply({
+      context,
+      agent,
+      session,
+      task,
+      plan,
+      reviewReport,
+      question: message,
+    });
+  }
+
+  if (!reply) {
+    reply = task
+      ? `I have context for task "${task.title}" (${task.status}), but I don't have a direct answer for that question yet.`
+      : "I don't have task context attached to this session, so I can't answer that question reliably.";
+  }
+
+  context.orch.createSessionMessage({
+    sessionId: session.id,
+    direction: "agent",
+    kind: "reply",
+    body: reply,
+  });
+  await writeSessionLog(context, session.id, `[agent/reply] ${reply}`);
+}
+
+async function resolveSessionContextTask(
+  context: DashboardContext,
+  session: AgentSession,
+): Promise<DashboardTaskSummary | null> {
+  if (session.task_id) {
+    const task = selectTaskById(context.conn.raw, session.task_id);
+    if (task) return task;
+  }
+
+  const latest = context.conn.raw
+    .prepare(
+      `
+      SELECT task_id
+      FROM task_events
+      WHERE actor_agent_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+    )
+    .get(session.agent_id) as { task_id: string } | undefined;
+  if (!latest?.task_id) return null;
+  return selectTaskById(context.conn.raw, latest.task_id);
+}
+
+function buildContextualFallbackReply(
+  question: string,
+  task: DashboardTaskSummary | null,
+  plan: string | null,
+  reviewReport: string | null,
+): string | null {
+  const normalized = question.trim().toLowerCase();
+  if (!normalized) return null;
+
+  if ((/\bplan\b/.test(normalized) || /\bpiano\b/.test(normalized)) && plan?.trim()) {
+    return `My latest plan for "${task?.title ?? "this task"}" was:\n\n${plan.trim()}`;
+  }
+
+  if ((/\breview\b/.test(normalized) || /\bbounce\b/.test(normalized) || /perch[ée]/.test(normalized)) && reviewReport?.trim()) {
+    return `My latest review note was:\n\n${reviewReport.trim()}`;
+  }
+
+  if (/\bwhat are you doing\b/.test(normalized) || /\bcosa stai facendo\b/.test(normalized) || /\bstatus\b/.test(normalized)) {
+    if (!task) return "I don't have an active task bound to this session right now.";
+    return `I'm working with task "${task.title}" in status "${task.status}".${plan?.trim() ? ` I also have an execution plan ready.` : ""}`;
+  }
+
+  return null;
+}
+
+async function tryCodexAgentReply(input: {
+  context: DashboardContext;
+  agent: Agent;
+  session: AgentSession;
+  task: DashboardTaskSummary | null;
+  plan: string | null;
+  reviewReport: string | null;
+  question: string;
+}): Promise<string | null> {
+  const { context, agent, session, task, plan, reviewReport, question } = input;
+  const runtimeDir = path.join(context.options.repoRoot, ".deltapilot", "dashboard-tmp");
+  await mkdir(runtimeDir, { recursive: true });
+  const outputPath = path.join(runtimeDir, `${session.id}-reply.txt`);
+  const prompt = [
+    "You are the DeltaPipeline managed agent answering a human from the dashboard.",
+    "Reply directly, concisely, and in plain text.",
+    "Do not modify files. Do not create commits. Do not ask follow-up questions unless there is no context.",
+    task
+      ? [
+          `Task ID: ${task.id}`,
+          `Title: ${task.title}`,
+          `Brief: ${task.brief || "(empty)"}`,
+          `Current status: ${task.status}`,
+          plan?.trim() ? `Execution plan:\n${plan.trim()}` : "",
+          reviewReport?.trim() ? `Review report:\n${reviewReport.trim()}` : "",
+        ].filter(Boolean).join("\n\n")
+      : "No task context is currently attached to this session.",
+    `Human question: ${question}`,
+  ].join("\n\n");
+
+  const cwd = task?.worktree_path && existsSync(task.worktree_path)
+    ? task.worktree_path
+    : context.options.repoRoot;
+  const base = (agent.command?.trim() || "codex").trim();
+  const command = `${base} exec --cd ${sh(cwd)} --color never --sandbox read-only --ephemeral --output-last-message ${sh(outputPath)} -`;
+  const shell = process.env.SHELL || "/bin/zsh";
+
+  const result = await new Promise<{ code: number | null; combined: string }>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(shell, ["-lc", command], {
+      cwd,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      resolve({ code: 1, combined: `${stderr}\n${stdout}\n${error.message}`.trim() });
+    });
+    child.on("close", (code) => {
+      resolve({ code, combined: `${stderr}\n${stdout}`.trim() });
+    });
+    child.stdin.end(prompt);
+  });
+
+  const lastMessage = await readFile(outputPath, "utf8").catch(() => "");
+  await rm(outputPath, { force: true }).catch(() => undefined);
+  if (result.code !== 0) {
+    await writeSessionLog(
+      context,
+      session.id,
+      `[agent/reply-error] ${result.combined || `codex reply exited with status ${result.code ?? "unknown"}`}`,
+    );
+    return null;
+  }
+
+  const reply = lastMessage.trim();
+  return reply || null;
+}
+
+function sh(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveTerminalShell(): string {
+  const candidates = [process.env.SHELL, "/bin/zsh", "/bin/bash", "/bin/sh"];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return "/bin/sh";
+}
+
+function buildTerminalEnv(): Record<string, string> {
+  const envEntries = Object.entries(process.env).filter((entry): entry is [string, string] =>
+    typeof entry[1] === "string"
+  );
+  return {
+    ...Object.fromEntries(envEntries),
+    TERM: "xterm-256color",
+    COLORTERM: process.env.COLORTERM || "truecolor",
+  };
+}
+
+async function startScreenTerminal(
+  context: DashboardContext,
+  sessionId: string,
+  command: string,
+  cwd: string,
+  env: Record<string, string>,
+): Promise<void> {
+  const sessionName = screenSessionNameFor(sessionId);
+  await execFileAsync("/usr/bin/screen", ["-dmS", sessionName, resolveTerminalShell()], {
+    cwd,
+    env,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await sendScreenInput(sessionName, `${command}\r`);
+  context.interactiveProcesses.set(sessionId, { kind: "screen", sessionName });
+  context.orch.updateAgentSession(sessionId, {
+    status: "busy",
+    pid: null,
+    lastSeenAt: new Date().toISOString(),
+    lastError: null,
+  });
+  await syncScreenTranscript(context, sessionId, sessionName);
+}
+
+function screenSessionNameFor(sessionId: string): string {
+  return `deltapilot-${sessionId}`;
+}
+
+async function screenSessionExists(sessionName: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/screen", ["-ls"]);
+    return stdout.includes(`.${sessionName}\t`) || stdout.includes(`.${sessionName} `);
+  } catch (error) {
+    const stdout = typeof error === "object" && error !== null && "stdout" in error
+      ? String((error as { stdout?: unknown }).stdout ?? "")
+      : "";
+    return stdout.includes(`.${sessionName}\t`) || stdout.includes(`.${sessionName} `);
+  }
+}
+
+async function sendScreenInput(sessionName: string, input: string): Promise<void> {
+  await execFileAsync("/usr/bin/screen", ["-S", sessionName, "-p", "0", "-X", "stuff", input]);
+}
+
+async function stopScreenSession(sessionName: string): Promise<void> {
+  await execFileAsync("/usr/bin/screen", ["-S", sessionName, "-X", "quit"]);
+}
+
+async function syncScreenTranscript(
+  context: DashboardContext,
+  sessionId: string,
+  sessionName: string,
+): Promise<string> {
+  const session = context.orch.getAgentSession(sessionId);
+  const hardcopyPath = `${session.log_path}.screen`;
+  await mkdir(path.dirname(hardcopyPath), { recursive: true });
+  await execFileAsync("/usr/bin/screen", ["-S", sessionName, "-p", "0", "-X", "hardcopy", "-h", hardcopyPath]);
+  if (!existsSync(hardcopyPath)) return "";
+  const raw = await readFile(hardcopyPath, "utf8");
+  return raw.slice(-24_000);
 }
