@@ -20,6 +20,8 @@ To inspect a live repo with the dashboard:
 pnpm dashboard -- --repo /abs/path/to/target/repo --host 0.0.0.0 --port 3000
 ```
 
+Use an absolute path for `--repo` so the dashboard can resolve the target repository correctly.
+
 For Docker-based deployment:
 
 ```bash
