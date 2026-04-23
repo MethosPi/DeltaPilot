@@ -14,6 +14,16 @@ export const agents = sqliteTable("agents", {
   lastSeenAt: text("last_seen_at"),
   cooldownUntil: text("cooldown_until"),
   lastLimitReason: text("last_limit_reason"),
+  providerFamily: text("provider_family").notNull().default("generic"),
+  modelId: text("model_id"),
+  contextWindow: integer("context_window"),
+  costTier: text("cost_tier").notNull().default("medium"),
+  supportsTools: integer("supports_tools").notNull().default(0),
+  supportsPatch: integer("supports_patch").notNull().default(0),
+  supportsReview: integer("supports_review").notNull().default(0),
+  maxConcurrency: integer("max_concurrency").notNull().default(1),
+  fallbackPriority: integer("fallback_priority").notNull().default(100),
+  healthState: text("health_state").notNull().default("healthy"),
 });
 
 export const tasks = sqliteTable(
@@ -28,7 +38,19 @@ export const tasks = sqliteTable(
     branchName: text("branch_name"),
     worktreePath: text("worktree_path"),
     acceptanceJson: text("acceptance_json"),
+    budgetJson: text("budget_json"),
     reviewBounceCount: integer("review_bounce_count").notNull().default(0),
+    humanReviewReason: text("human_review_reason"),
+    prProvider: text("pr_provider"),
+    prBaseBranch: text("pr_base_branch"),
+    prHeadBranch: text("pr_head_branch"),
+    prHeadSha: text("pr_head_sha"),
+    prNumber: integer("pr_number"),
+    prUrl: text("pr_url"),
+    prReviewDecision: text("pr_review_decision"),
+    prMergedSha: text("pr_merged_sha"),
+    prLastSyncedAt: text("pr_last_synced_at"),
+    prLastError: text("pr_last_error"),
     lastRole: text("last_role"),
     statusNote: text("status_note"),
     createdAt: text("created_at").notNull(),
@@ -45,6 +67,37 @@ export const tasks = sqliteTable(
       t.status,
       t.priority,
     ),
+  }),
+);
+
+export const taskAttempts = sqliteTable(
+  "task_attempts",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    role: text("role").notNull(),
+    provider: text("provider").notNull(),
+    model: text("model"),
+    attemptNumber: integer("attempt_number").notNull(),
+    startedAt: text("started_at").notNull(),
+    endedAt: text("ended_at"),
+    outcome: text("outcome"),
+    handoffReason: text("handoff_reason"),
+    promptTokens: integer("prompt_tokens"),
+    completionTokens: integer("completion_tokens"),
+    estimatedCostUsd: text("estimated_cost_usd"),
+    latencyMs: integer("latency_ms"),
+    checkpointArtifactId: text("checkpoint_artifact_id").references(() => artifacts.id),
+  },
+  (t) => ({
+    taskIdx: index("task_attempts_task_idx").on(t.taskId, t.startedAt),
+    agentIdx: index("task_attempts_agent_idx").on(t.agentId, t.startedAt),
+    activeIdx: index("task_attempts_active_idx").on(t.taskId, t.endedAt),
   }),
 );
 

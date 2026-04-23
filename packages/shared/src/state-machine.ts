@@ -10,7 +10,7 @@ export class InvalidTransitionError extends Error {
   }
 }
 
-type StaticEventKind = Exclude<TaskEvent["kind"], "review_decision">;
+type StaticEventKind = Exclude<TaskEvent["kind"], "review_decision" | "merge_result">;
 type Transition = Partial<Record<StaticEventKind, TaskStatus>>;
 
 const STATIC_TRANSITIONS: Record<TaskStatus, Transition> = {
@@ -36,12 +36,18 @@ const STATIC_TRANSITIONS: Record<TaskStatus, Transition> = {
     start_review: "review",
     enter_human_review: "human_review",
     report_limit: "review",
-    approve: "done",
+    approve: "human_review",
     bounce: "todo",
     cancel: "cancelled",
   },
   human_review: {
     return_to_todo: "todo",
+    queue_merge: "merging",
+    cancel: "cancelled",
+  },
+  merging: {
+    start_merge: "merging",
+    report_limit: "merging",
     cancel: "cancelled",
   },
   done: {},
@@ -49,7 +55,11 @@ const STATIC_TRANSITIONS: Record<TaskStatus, Transition> = {
 };
 
 function reviewDecisionTarget(decision: ReviewDecision): TaskStatus {
-  return decision === "approve" ? "done" : "todo";
+  return decision === "approve" ? "human_review" : "todo";
+}
+
+function mergeResultTarget(event: Extract<TaskEvent, { kind: "merge_result" }>): TaskStatus {
+  return event.result === "merged" ? "done" : "human_review";
 }
 
 export function nextStatus(current: TaskStatus, event: TaskEvent): TaskStatus {
@@ -58,6 +68,13 @@ export function nextStatus(current: TaskStatus, event: TaskEvent): TaskStatus {
       throw new InvalidTransitionError(current, event.kind);
     }
     return reviewDecisionTarget(event.decision);
+  }
+
+  if (event.kind === "merge_result") {
+    if (current !== "merging") {
+      throw new InvalidTransitionError(current, event.kind);
+    }
+    return mergeResultTarget(event);
   }
 
   const candidate = STATIC_TRANSITIONS[current][event.kind as StaticEventKind];
@@ -71,6 +88,9 @@ export function canTransition(current: TaskStatus, event: TaskEvent["kind"]): bo
   if (event === "review_decision") {
     return current === "review";
   }
+  if (event === "merge_result") {
+    return current === "merging";
+  }
   return STATIC_TRANSITIONS[current][event as StaticEventKind] !== undefined;
 }
 
@@ -78,6 +98,9 @@ export function allowedEvents(current: TaskStatus): ReadonlyArray<TaskEvent["kin
   const base = Object.keys(STATIC_TRANSITIONS[current]) as TaskEvent["kind"][];
   if (current === "review") {
     return [...base, "review_decision"];
+  }
+  if (current === "merging") {
+    return [...base, "merge_result"];
   }
   return base;
 }

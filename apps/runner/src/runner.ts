@@ -1,9 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { WorktreeManager, openDatabase, Orchestrator } from "@deltapilot/core";
-import type { Agent, Task } from "@deltapilot/shared";
+import {
+  GitHubCliHelper,
+  type GitHubHelper,
+  Orchestrator,
+  WorktreeManager,
+  openDatabase,
+  rankAgentsForTask,
+  roleForTask,
+} from "@deltapilot/core";
+import type { Agent, Task, TaskPullRequest } from "@deltapilot/shared";
 import { commitWorktree } from "./git-commit.js";
 import { getAdapter, hasAdapter } from "./adapters.js";
 
@@ -12,6 +19,7 @@ const MANAGED_START_COMMAND_DEFAULTS: Partial<Record<Agent["kind"], string>> = {
   "claude-code": "claude",
   "claude-sdk": "claude",
   openclaw: "openclaw gateway start",
+  ollama: "ollama run qwen2.5-coder:7b",
   opendevin: "opendevin",
   hermes: "hermes",
 };
@@ -20,6 +28,7 @@ export interface RunnerOptions {
   repoRoot: string;
   dbPath: string;
   pollIntervalMs?: number;
+  githubHelper?: GitHubHelper;
 }
 
 export class Runner {
@@ -28,6 +37,7 @@ export class Runner {
   readonly pollIntervalMs: number;
   readonly orch: Orchestrator;
   readonly worktreeMgr: WorktreeManager;
+  readonly github: GitHubHelper;
 
   private readonly conn;
   private readonly sessionsDir: string;
@@ -39,6 +49,7 @@ export class Runner {
     this.repoRoot = options.repoRoot;
     this.dbPath = options.dbPath;
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
+    this.github = options.githubHelper ?? new GitHubCliHelper();
     this.conn = openDatabase(this.dbPath);
     this.sessionsDir = path.join(this.repoRoot, ".deltapilot", "sessions");
     this.worktreeMgr = new WorktreeManager({
@@ -79,21 +90,57 @@ export class Runner {
 
   async runOnce(): Promise<void> {
     await mkdir(this.sessionsDir, { recursive: true });
+    await this.queueApprovedMergeTasks();
     const agents = this.selectManagedAgents();
+    const readyAgents: Array<{ agent: Agent; sessionId: string }> = [];
+
     for (const agent of agents) {
       const session = await this.ensureSession(agent);
-      if (!hasAdapter(agent.kind)) continue;
+      if (agent.role !== "merger" && !hasAdapter(agent.kind)) continue;
       if (this.inFlight.has(session.id)) continue;
       if (!["ready", "starting"].includes(session.status)) continue;
 
       const existing = this.orch.getAssignedTask(agent.id);
-      const task = existing ?? await this.orch.claimNextTask(agent.id);
-      if (!task) continue;
+      if (existing) {
+        this.queueTaskRun(agent, session.id, existing);
+        continue;
+      }
 
-      const run = this.runTask(agent, session.id, task).finally(() => {
-        this.inFlight.delete(session.id);
+      readyAgents.push({ agent, sessionId: session.id });
+    }
+
+    const activeAssignments = Object.fromEntries(
+      agents.map((agent) => [agent.id, this.orch.getAssignedTask(agent.id) ? 1 : 0]),
+    );
+
+    const queuedTasks = this.orch
+      .listTasks()
+      .filter((task) => task.assigned_agent_id === null)
+      .filter((task) => roleForTask(task) !== null);
+
+    for (const task of queuedTasks) {
+      const role = roleForTask(task);
+      if (!role) continue;
+      const candidates = readyAgents.filter(({ agent }) => agent.role === role);
+      if (candidates.length === 0) continue;
+
+      const ranked = rankAgentsForTask({
+        task,
+        role,
+        agents: candidates.map(({ agent }) => agent),
+        attempts: this.orch.listTaskAttempts({ taskId: task.id }),
+        activeAssignments,
       });
-      this.inFlight.set(session.id, run);
+      const selected = ranked.find((candidate) => !candidate.blocked);
+      if (!selected) continue;
+
+      const target = candidates.find(({ agent }) => agent.id === selected.agent_id);
+      if (!target) continue;
+      const claimed = await this.orch.claimTaskForAgent(task.id, target.agent.id);
+      if (!claimed) continue;
+
+      activeAssignments[target.agent.id] = (activeAssignments[target.agent.id] ?? 0) + 1;
+      this.queueTaskRun(target.agent, target.sessionId, claimed);
     }
   }
 
@@ -104,20 +151,25 @@ export class Runner {
       .filter((agent) => agent.runtime_mode === "managed" && agent.enabled)
       .filter((agent) => !agent.cooldown_until || new Date(agent.cooldown_until).getTime() <= now)
       .sort((a, b) => {
-        const aSession = this.orch.getOpenSessionForAgent(a.id);
-        const bSession = this.orch.getOpenSessionForAgent(b.id);
-        const aHealthy = aSession && ["ready", "starting"].includes(aSession.status) ? 0 : 1;
-        const bHealthy = bSession && ["ready", "starting"].includes(bSession.status) ? 0 : 1;
-        if (aHealthy !== bHealthy) return aHealthy - bHealthy;
-
-        const aAssigned = this.orch.getAssignedTask(a.id) ? 1 : 0;
-        const bAssigned = this.orch.getAssignedTask(b.id) ? 1 : 0;
-        if (aAssigned !== bAssigned) return aAssigned - bAssigned;
-
-        const aSeen = Date.parse(a.last_seen_at ?? a.registered_at);
-        const bSeen = Date.parse(b.last_seen_at ?? b.registered_at);
-        return bSeen - aSeen;
+        if (a.role !== b.role) return a.role.localeCompare(b.role);
+        if (a.health_state !== b.health_state) {
+          return healthStateRank(a.health_state) - healthStateRank(b.health_state);
+        }
+        if (a.fallback_priority !== b.fallback_priority) {
+          return a.fallback_priority - b.fallback_priority;
+        }
+        return a.name.localeCompare(b.name);
       });
+  }
+
+  private queueTaskRun(agent: Agent, sessionId: string, task: Task): void {
+    if (this.inFlight.has(sessionId)) return;
+    const run = (agent.role === "merger"
+      ? this.runMergeTask(agent, sessionId, task)
+      : this.runTask(agent, sessionId, task)).finally(() => {
+      this.inFlight.delete(sessionId);
+    });
+    this.inFlight.set(sessionId, run);
   }
 
   private async ensureSession(agent: Agent) {
@@ -142,7 +194,7 @@ export class Runner {
     if (agent.command?.trim()) {
       await this.writeLog(session.id, `managed command: ${agent.command.trim()}`);
     }
-    if (!hasAdapter(agent.kind)) {
+    if (agent.role !== "merger" && !hasAdapter(agent.kind)) {
       await this.writeLog(session.id, unsupportedAdapterMessage(agent));
       await this.startManagedBootstrap(agent, session.id);
       session = this.orch.getAgentSession(session.id);
@@ -153,6 +205,7 @@ export class Runner {
   private async runTask(agent: Agent, sessionId: string, task: Task): Promise<void> {
     const adapter = getAdapter(agent.kind);
     const controller = new AbortController();
+    const startedAt = Date.now();
     this.orch.updateAgentSession(sessionId, {
       status: "busy",
       taskId: task.id,
@@ -180,14 +233,20 @@ export class Runner {
         sessionId,
         orchestrator: this.orch,
       });
+      this.orch.reportTaskUsage(task.id, agent.id, {
+        provider: agent.provider_family,
+        model: agent.model_id,
+        latencyMs: Date.now() - startedAt,
+      });
 
       switch (result.kind) {
         case "ok": {
-          await this.handleSuccess(agent, sessionId, task, worktreePath, result);
+          await this.handleSuccess(agent, sessionId, hydratedTask, worktreePath, result);
           break;
         }
         case "rate_limit":
-        case "context_limit": {
+        case "context_limit":
+        case "budget_exceeded": {
           await this.orch.reportLimit(task.id, agent.id, result.kind);
           await this.orch.updateAgentSession(sessionId, {
             status: "ready",
@@ -240,6 +299,162 @@ export class Runner {
     }
   }
 
+  private async runMergeTask(agent: Agent, sessionId: string, task: Task): Promise<void> {
+    this.orch.updateAgentSession(sessionId, {
+      status: "busy",
+      taskId: task.id,
+      lastError: null,
+    });
+    await this.writeLog(sessionId, `[${agent.role}] start ${task.id} ${task.title}`);
+
+    try {
+      const hydratedTask = await this.ensureTaskWorktree(task);
+      const worktreePath = hydratedTask.worktree_path;
+      const pullRequest = hydratedTask.pull_request;
+      if (!worktreePath) {
+        throw new Error(`task ${task.id} has no worktree`);
+      }
+      if (!pullRequest?.number || !pullRequest.head_branch) {
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "blocked",
+          reason: "approval",
+          note: "Pull request metadata is missing. Re-run review approval to publish the PR.",
+          pullRequest: {
+            lastError: "Pull request metadata is missing",
+            lastSyncedAt: new Date().toISOString(),
+          },
+          preserveWorktree: true,
+        });
+        await this.writeLog(sessionId, "merge blocked: missing PR metadata");
+        await this.finishAgentRun(agent, sessionId);
+        return;
+      }
+
+      const refreshed = await this.github.readPullRequest({
+        repoRoot: this.repoRoot,
+        branchName: pullRequest.head_branch,
+        baseBranch: pullRequest.base_branch,
+      });
+      if (!refreshed || refreshed.review_decision !== "APPROVED") {
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "reapproval_required",
+          reason: "approval",
+          note: "Pull request approval is no longer present. Approve the PR again to resume merging.",
+          pullRequest: toPullRequestUpdate(refreshed ?? {
+            ...pullRequest,
+            review_decision: "UNKNOWN",
+            last_error: "Pull request not found on GitHub",
+            last_synced_at: new Date().toISOString(),
+          }),
+          preserveWorktree: true,
+        });
+        await this.writeLog(sessionId, "merge returned to human review: PR is not approved");
+        await this.finishAgentRun(agent, sessionId);
+        return;
+      }
+
+      this.orch.updateTaskPullRequest(task.id, toPullRequestUpdate(refreshed));
+
+      try {
+        await this.github.rebaseBranch({
+          repoRoot: this.repoRoot,
+          worktreePath,
+          branchName: pullRequest.head_branch,
+          baseBranch: pullRequest.base_branch,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "blocked",
+          reason: "merge_conflict",
+          note: message,
+          pullRequest: {
+            ...toPullRequestUpdate(refreshed),
+            lastError: message,
+            lastSyncedAt: new Date().toISOString(),
+          },
+          preserveWorktree: true,
+        });
+        await this.writeLog(sessionId, `merge blocked after rebase failure: ${message}`);
+        await this.finishAgentRun(agent, sessionId);
+        return;
+      }
+
+      const afterRebase = await this.github.readPullRequest({
+        repoRoot: this.repoRoot,
+        branchName: pullRequest.head_branch,
+        baseBranch: pullRequest.base_branch,
+      });
+      const latestPullRequest = afterRebase ?? refreshed;
+      this.orch.updateTaskPullRequest(task.id, toPullRequestUpdate(latestPullRequest));
+
+      if (!afterRebase || afterRebase.review_decision !== "APPROVED") {
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "reapproval_required",
+          reason: "approval",
+          note: "Pull request approval must be granted again after the rebase.",
+          pullRequest: {
+            ...toPullRequestUpdate(latestPullRequest),
+            lastError: null,
+            lastSyncedAt: new Date().toISOString(),
+          },
+          preserveWorktree: true,
+        });
+        await this.writeLog(sessionId, "merge returned to human review: approval dismissed after rebase");
+        await this.finishAgentRun(agent, sessionId);
+        return;
+      }
+
+      try {
+        const merged = await this.github.mergePullRequest({
+          repoRoot: this.repoRoot,
+          pullRequestNumber: afterRebase.number ?? pullRequest.number,
+          baseBranch: afterRebase.base_branch,
+        });
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "merged",
+          mergedSha: merged.mergedSha,
+          note: `Merged PR #${afterRebase.number ?? pullRequest.number} into ${afterRebase.base_branch}.`,
+          pullRequest: {
+            ...toPullRequestUpdate(afterRebase),
+            mergedSha: merged.mergedSha,
+            lastError: null,
+            lastSyncedAt: new Date().toISOString(),
+          },
+        });
+        await this.writeLog(sessionId, `merged PR #${afterRebase.number ?? pullRequest.number} @ ${merged.mergedSha}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.orch.submitMergeResult(task.id, agent.id, {
+          result: "blocked",
+          reason: "approval",
+          note: message,
+          pullRequest: {
+            ...toPullRequestUpdate(afterRebase),
+            lastError: message,
+            lastSyncedAt: new Date().toISOString(),
+          },
+          preserveWorktree: true,
+        });
+        await this.writeLog(sessionId, `merge blocked by GitHub policy: ${message}`);
+      }
+
+      await this.finishAgentRun(agent, sessionId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.writeLog(sessionId, `crash: ${message}`);
+      if (this.orch.getAssignedTask(agent.id)?.id === task.id) {
+        await this.orch.reportLimit(task.id, agent.id, "crash").catch(() => undefined);
+      }
+      this.orch.setAgentCooldown(agent.id, this.cooldownAt(), "crash");
+      this.orch.updateAgentSession(sessionId, {
+        status: "ready",
+        taskId: null,
+        lastError: message,
+      });
+    }
+  }
+
   private async handleSuccess(
     agent: Agent,
     sessionId: string,
@@ -251,6 +466,8 @@ export class Runner {
       decision?: "approve" | "bounce";
     },
   ): Promise<void> {
+    await this.writeCheckpoint(agent, task, result);
+
     switch (agent.role) {
       case "planner": {
         const plan = result.output ?? result.message ?? `Plan for ${task.title}`;
@@ -269,23 +486,57 @@ export class Runner {
       }
       case "reviewer": {
         const decision = result.decision ?? "approve";
-        await this.orch.submitReview(task.id, agent.id, {
-          decision,
-          ...(result.output || result.message
-            ? { note: result.output ?? result.message }
-            : {}),
-        });
-        await this.writeLog(sessionId, `submitted review decision=${decision}`);
+        const note = result.output ?? result.message ?? null;
+        if (decision === "approve") {
+          try {
+            const pullRequest = await this.github.ensurePullRequest({
+              repoRoot: this.repoRoot,
+              worktreePath,
+              branchName: task.branch_name ?? `deltapilot/task/${task.id}`,
+              title: task.title,
+              body: buildPullRequestBody(task, note),
+            });
+            const diffStat = await this.github.diffStat(worktreePath, pullRequest.base_branch);
+            const packet = this.github.buildHumanReviewPacket({
+              worktreePath,
+              branchName: pullRequest.head_branch,
+              acceptance: task.acceptance,
+              reviewNote: note,
+              diffStat,
+              pullRequest,
+            });
+            await this.orch.writeArtifact(task.id, "human_review_packet", packet, agent.id);
+            await this.orch.approveForHumanReview(task.id, {
+              note: note ?? "Reviewer approved the implementation.",
+              reason: "approval",
+              pullRequest: toPullRequestUpdate(pullRequest),
+              preserveWorktree: true,
+            }, agent.id);
+            await this.writeLog(sessionId, `submitted review decision=approve PR=#${pullRequest.number ?? "?"}`);
+          } catch (error) {
+            const message = `Failed to publish the PR for human review: ${error instanceof Error ? error.message : String(error)}`;
+            await this.orch.failHumanReviewApproval(task.id, message, agent.id, {
+              lastError: message,
+              lastSyncedAt: new Date().toISOString(),
+            });
+            await this.writeLog(sessionId, `review approval blocked: ${message}`);
+          }
+        } else {
+          await this.orch.submitReview(task.id, agent.id, {
+            decision,
+            ...(note ? { note } : {}),
+          });
+          await this.writeLog(sessionId, `submitted review decision=${decision}`);
+        }
+        break;
+      }
+      case "merger": {
+        throw new Error("Merger tasks are handled separately");
         break;
       }
     }
 
-    this.orch.setAgentCooldown(agent.id, null, null);
-    this.orch.updateAgentSession(sessionId, {
-      status: "ready",
-      taskId: null,
-      lastError: null,
-    });
+    await this.finishAgentRun(agent, sessionId);
   }
 
   private async writeLog(sessionId: string, line: string): Promise<void> {
@@ -301,26 +552,75 @@ export class Runner {
     return new Date(Date.now() + 60_000).toISOString();
   }
 
-  private async ensureTaskWorktree(task: Task): Promise<Task> {
-    if (task.worktree_path && existsSync(task.worktree_path)) return task;
+  private async finishAgentRun(agent: Agent, sessionId: string): Promise<void> {
+    this.orch.setAgentCooldown(agent.id, null, null);
+    this.orch.updateAgentSession(sessionId, {
+      status: "ready",
+      taskId: null,
+      lastError: null,
+    });
+  }
 
-    const expectedPath = this.worktreeMgr.pathFor(task.id);
-    const expectedBranch = task.branch_name ?? this.worktreeMgr.branchFor(task.id);
-    let branchName = expectedBranch;
-    let worktreePath = expectedPath;
+  private async writeCheckpoint(
+    agent: Agent,
+    task: Task,
+    result: {
+      message?: string;
+      output?: string;
+      decision?: "approve" | "bounce";
+    },
+  ): Promise<void> {
+    const summary = (result.output ?? result.message ?? `${agent.role} completed ${task.title}`).trim();
+    await this.orch.publishCheckpoint(task.id, agent.id, {
+      summary,
+      files_touched: task.acceptance?.files_in_scope ?? [],
+      tests_ran: task.acceptance?.success_test ? [task.acceptance.success_test] : [],
+      commands_ran: [],
+      next_steps: checkpointNextSteps(agent.role, result.decision),
+      risks: [],
+    });
+  }
 
-    if (!existsSync(expectedPath)) {
-      const result = task.branch_name
-        ? await this.worktreeMgr.attachWorktree(task.id)
-        : await this.worktreeMgr.createWorktree(task.id);
-      branchName = result.branchName;
-      worktreePath = result.worktreePath;
+  private async queueApprovedMergeTasks(): Promise<void> {
+    const candidates = this.orch
+      .listTasks({ status: "human_review" })
+      .filter((task) => task.human_review_reason === "approval")
+      .filter((task) => task.assigned_agent_id === null)
+      .filter((task) => Boolean(task.pull_request?.head_branch));
+
+    for (const task of candidates) {
+      const branchName = task.pull_request?.head_branch;
+      if (!branchName) continue;
+      try {
+        const refreshed = await this.github.readPullRequest({
+          repoRoot: this.repoRoot,
+          branchName,
+          baseBranch: task.pull_request?.base_branch ?? "main",
+        });
+        if (!refreshed) {
+          this.orch.updateTaskPullRequest(task.id, {
+            lastError: "Pull request not found on GitHub",
+            lastSyncedAt: new Date().toISOString(),
+            reviewDecision: "UNKNOWN",
+          });
+          continue;
+        }
+        this.orch.updateTaskPullRequest(task.id, toPullRequestUpdate(refreshed));
+        if (refreshed.review_decision === "APPROVED") {
+          this.orch.queueMerge(task.id);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.orch.updateTaskPullRequest(task.id, {
+          lastError: message,
+          lastSyncedAt: new Date().toISOString(),
+        });
+      }
     }
+  }
 
-    this.conn.raw
-      .prepare("UPDATE tasks SET branch_name = ?, worktree_path = ?, updated_at = ? WHERE id = ?")
-      .run(branchName, worktreePath, new Date().toISOString(), task.id);
-    return this.orch.getTask(task.id);
+  private async ensureTaskWorktree(task: Task): Promise<Task> {
+    return this.orch.ensureTaskWorktree(task.id);
   }
 
   private async startManagedBootstrap(agent: Agent, sessionId: string): Promise<void> {
@@ -392,8 +692,78 @@ function unsupportedAdapterMessage(agent: Agent): string {
   return `no DeltaPipeline task adapter for kind "${agent.kind}"${command ? ` (configured command: ${command})` : ""}`;
 }
 
+function checkpointNextSteps(
+  role: Agent["role"],
+  decision?: "approve" | "bounce",
+): string[] {
+  switch (role) {
+    case "planner":
+      return ["Executor should implement the published plan."];
+    case "executor":
+      return ["Reviewer should validate the implementation against acceptance criteria."];
+    case "reviewer":
+      return [decision === "approve"
+        ? "Human review and PR validation are next."
+        : "Executor should address the review feedback."];
+    case "merger":
+      return ["Merge flow completed."];
+  }
+}
+
+function healthStateRank(state: Agent["health_state"]): number {
+  switch (state) {
+    case "healthy":
+      return 0;
+    case "degraded":
+      return 1;
+    case "cooldown":
+      return 2;
+    case "offline":
+      return 3;
+  }
+}
+
 function resolveManagedStartCommand(agent: Agent): string | null {
   return agent.command?.trim()
     || MANAGED_START_COMMAND_DEFAULTS[agent.kind]
     || null;
+}
+
+function buildPullRequestBody(task: Task, reviewNote: string | null): string {
+  const sections = [
+    "## Task",
+    "",
+    task.brief || task.title,
+    "",
+  ];
+
+  if (task.acceptance?.deliverables.length) {
+    sections.push("## Deliverables", "");
+    for (const item of task.acceptance.deliverables) {
+      sections.push(`- ${item}`);
+    }
+    sections.push("");
+  }
+
+  if (task.acceptance?.success_test) {
+    sections.push("## Success Test", "", task.acceptance.success_test, "");
+  }
+
+  sections.push("## Reviewer Note", "", reviewNote?.trim() || "Approved by the reviewer agent.", "");
+  return sections.join("\n");
+}
+
+function toPullRequestUpdate(pullRequest: TaskPullRequest) {
+  return {
+    provider: pullRequest.provider,
+    baseBranch: pullRequest.base_branch,
+    headBranch: pullRequest.head_branch,
+    headSha: pullRequest.head_sha,
+    number: pullRequest.number,
+    url: pullRequest.url,
+    reviewDecision: pullRequest.review_decision,
+    mergedSha: pullRequest.merged_sha,
+    lastSyncedAt: pullRequest.last_synced_at,
+    lastError: pullRequest.last_error,
+  } as const;
 }

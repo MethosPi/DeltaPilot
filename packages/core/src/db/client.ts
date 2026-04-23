@@ -22,6 +22,8 @@ const MIGRATIONS: ReadonlyArray<{ version: number; file: string }> = [
   { version: 2, file: "migrations/0001_autonomous_pipeline.sql" },
   { version: 3, file: "migrations/0002_task_attachments.sql" },
   { version: 4, file: "migrations/0003_task_archiving.sql" },
+  { version: 5, file: "migrations/0004_pr_human_review.sql" },
+  { version: 6, file: "migrations/0005_router_attempts.sql" },
 ];
 
 export function openDatabase(dbPath: string): OpenDatabaseResult {

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="DeltaPilot">
+  <defs>
+    <linearGradient id="dp-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5e6ad2" />
+      <stop offset="100%" stop-color="#4cc38a" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0a0a0b" />
+  <path d="M14 48V16h17c11 0 19 6 19 16s-8 16-19 16H14Zm10-9h7c6 0 10-2.7 10-7s-4-7-10-7h-7v14Z" fill="url(#dp-gradient)" />
+  <path d="M38 18h12v28H38z" fill="#f2c94c" opacity=".92" />
+</svg>

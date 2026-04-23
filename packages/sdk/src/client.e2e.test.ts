@@ -92,6 +92,43 @@ describe("DeltaPilotClient — subprocess e2e", () => {
   );
 
   it(
+    "publishCheckpoint, reportUsage, and requestApproval work against the MCP server",
+    async () => {
+      const claimed = await client.claimTask();
+      expect(claimed?.id).toBe(taskId);
+
+      const checkpoint = await client.publishCheckpoint(taskId, {
+        summary: "Checkpoint from SDK",
+        files_touched: ["README.md"],
+        tests_ran: [],
+        commands_ran: [],
+        next_steps: ["Continue implementation"],
+        risks: [],
+      });
+      expect(checkpoint.checkpoint_artifact_id).toBeTruthy();
+
+      const usage = await client.reportUsage(taskId, {
+        provider: "openai",
+        model: "gpt-5.4",
+        promptTokens: 250,
+        completionTokens: 125,
+        estimatedCostUsd: 0.11,
+        latencyMs: 1200,
+      });
+      expect(usage.prompt_tokens).toBe(250);
+
+      const approval = await client.requestApproval({
+        taskId,
+        title: "Need approval",
+        body: "Confirm the next fallback step.",
+      });
+      expect(approval.task_id).toBe(taskId);
+      expect(approval.status).toBe("pending");
+    },
+    20_000,
+  );
+
+  it(
     "withAutoHandoff wires a synthetic 429 into a real requeue on the orchestrator",
     async () => {
       await client.claimTask();

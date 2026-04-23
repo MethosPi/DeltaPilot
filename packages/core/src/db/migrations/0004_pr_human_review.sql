@@ -1,0 +1,11 @@
+ALTER TABLE tasks ADD COLUMN human_review_reason TEXT;
+ALTER TABLE tasks ADD COLUMN pr_provider TEXT;
+ALTER TABLE tasks ADD COLUMN pr_base_branch TEXT;
+ALTER TABLE tasks ADD COLUMN pr_head_branch TEXT;
+ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT;
+ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
+ALTER TABLE tasks ADD COLUMN pr_url TEXT;
+ALTER TABLE tasks ADD COLUMN pr_review_decision TEXT;
+ALTER TABLE tasks ADD COLUMN pr_merged_sha TEXT;
+ALTER TABLE tasks ADD COLUMN pr_last_synced_at TEXT;
+ALTER TABLE tasks ADD COLUMN pr_last_error TEXT;

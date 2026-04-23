@@ -1,6 +1,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { AcceptanceCriteria, Handoff, ReviewDecision, Task } from "@deltapilot/shared";
+import type {
+  AcceptanceCriteria,
+  ApprovalRequest,
+  Handoff,
+  ReviewDecision,
+  Task,
+  TaskAttempt,
+  TaskCheckpoint,
+} from "@deltapilot/shared";
 import type { HandoffClient, HandoffReason } from "./interceptor.js";
 
 export interface ConnectOptions {
@@ -20,10 +28,8 @@ export interface ConnectOptions {
 
 /**
  * Reference runtime an agent embeds to talk to DeltaPilot. Thin wrapper over
- * MCP stdio that (a) narrows the tool surface to the three calls an agent
- * actually makes (claim, submit, report) and (b) parses the JSON payloads
- * back into typed domain objects. Heartbeat / request_handoff will be added
- * when something in the agent loop calls them.
+ * MCP stdio that exposes the agent-facing tool surface and parses JSON
+ * payloads back into typed domain objects.
  */
 export class DeltaPilotClient implements HandoffClient {
   private constructor(
@@ -94,6 +100,58 @@ export class DeltaPilotClient implements HandoffClient {
       arguments: { task_id: taskId, reason },
     });
     return parseJson<Handoff>(res);
+  }
+
+  async publishCheckpoint(taskId: string, checkpoint: TaskCheckpoint): Promise<TaskAttempt> {
+    const res = await this.client.callTool({
+      name: "publish_checkpoint",
+      arguments: {
+        task_id: taskId,
+        ...checkpoint,
+      },
+    });
+    return parseJson<TaskAttempt>(res);
+  }
+
+  async reportUsage(taskId: string, input: {
+    provider?: "openai" | "anthropic" | "openclaw" | "ollama" | "generic";
+    model?: string;
+    promptTokens?: number;
+    completionTokens?: number;
+    estimatedCostUsd?: number;
+    latencyMs?: number;
+  }): Promise<TaskAttempt> {
+    const res = await this.client.callTool({
+      name: "report_usage",
+      arguments: {
+        task_id: taskId,
+        ...(input.provider !== undefined ? { provider: input.provider } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.promptTokens !== undefined ? { prompt_tokens: input.promptTokens } : {}),
+        ...(input.completionTokens !== undefined ? { completion_tokens: input.completionTokens } : {}),
+        ...(input.estimatedCostUsd !== undefined ? { estimated_cost_usd: input.estimatedCostUsd } : {}),
+        ...(input.latencyMs !== undefined ? { latency_ms: input.latencyMs } : {}),
+      },
+    });
+    return parseJson<TaskAttempt>(res);
+  }
+
+  async requestApproval(input: {
+    taskId?: string;
+    kind?: "approval" | "question";
+    title: string;
+    body: string;
+  }): Promise<ApprovalRequest> {
+    const res = await this.client.callTool({
+      name: "request_approval",
+      arguments: {
+        ...(input.taskId !== undefined ? { task_id: input.taskId } : {}),
+        ...(input.kind !== undefined ? { kind: input.kind } : {}),
+        title: input.title,
+        body: input.body,
+      },
+    });
+    return parseJson<ApprovalRequest>(res);
   }
 
   async close(): Promise<void> {

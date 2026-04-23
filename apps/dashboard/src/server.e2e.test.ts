@@ -1,10 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { Orchestrator, WorktreeManager, openDatabase } from "@deltapilot/core";
+import {
+  Orchestrator,
+  WorktreeManager,
+  openDatabase,
+  type GitHubHelper,
+} from "@deltapilot/core";
 import { startDashboardServer, type StartedDashboardServer } from "./server.js";
 
 const execFileAsync = promisify(execFile);
@@ -24,15 +29,47 @@ describe("dashboard server — e2e", () => {
   let repoRoot: string;
   let dbPath: string;
   let server: StartedDashboardServer;
+  let githubHelper: GitHubHelper;
 
   beforeEach(async () => {
     repoRoot = await makeRepo();
     dbPath = path.join(repoRoot, ".deltapilot-data.db");
+    githubHelper = {
+      ensurePullRequest: vi.fn(async ({ branchName, baseBranch }) => ({
+        provider: "github" as const,
+        base_branch: baseBranch ?? "main",
+        head_branch: branchName,
+        head_sha: "dashboard-pr-sha",
+        number: 7,
+        url: "https://github.com/example/repo/pull/7",
+        review_decision: "APPROVED" as const,
+        merged_sha: null,
+        last_synced_at: new Date().toISOString(),
+        last_error: null,
+      })),
+      readPullRequest: vi.fn(async ({ branchName, baseBranch }) => ({
+        provider: "github" as const,
+        base_branch: baseBranch ?? "main",
+        head_branch: branchName,
+        head_sha: "dashboard-pr-sha",
+        number: 7,
+        url: "https://github.com/example/repo/pull/7",
+        review_decision: "APPROVED" as const,
+        merged_sha: null,
+        last_synced_at: new Date().toISOString(),
+        last_error: null,
+      })),
+      diffStat: vi.fn(async () => " README.md | 1 +"),
+      rebaseBranch: vi.fn(async () => ({ headSha: "dashboard-pr-sha" })),
+      mergePullRequest: vi.fn(async () => ({ mergedSha: "merged-main-sha" })),
+      buildHumanReviewPacket: vi.fn(() => "# Human Review Packet\n\nPR: https://github.com/example/repo/pull/7"),
+    };
     server = await startDashboardServer({
       repoRoot,
       dbPath,
       host: "127.0.0.1",
       port: 0,
+      githubHelper,
     });
   });
 
@@ -52,6 +89,12 @@ describe("dashboard server — e2e", () => {
         acceptance: {
           deliverables: ["task.md"],
         },
+        budget: {
+          soft_cost_usd: 0.5,
+          hard_cost_usd: 1,
+          soft_attempts: 2,
+          hard_attempts: 4,
+        },
       }),
     });
     expect(createRes.status).toBe(201);
@@ -66,13 +109,14 @@ describe("dashboard server — e2e", () => {
     expect(snapshotRes.status).toBe(200);
     const snapshot = (await snapshotRes.json()) as {
       stats: Record<string, number>;
-      tasks: Array<{ id: string; status: string; title: string }>;
+      tasks: Array<{ id: string; status: string; title: string; budget: { hard_attempts: number } | null }>;
     };
     expect(Object.keys(snapshot.stats).sort()).toEqual([
       "cancelled",
       "done",
       "human_review",
       "in_progress",
+      "merging",
       "planning",
       "review",
       "todo",
@@ -84,6 +128,9 @@ describe("dashboard server — e2e", () => {
           title: "dashboard task",
           status: "todo",
           priority_label: "high",
+          budget: expect.objectContaining({
+            hard_attempts: 4,
+          }),
         }),
       ]),
     );
@@ -304,8 +351,18 @@ describe("dashboard server — e2e", () => {
       body: JSON.stringify({ kind: "approve" }),
     });
     expect(approveRes.status).toBe(200);
-    const detail = (await approveRes.json()) as { task: { status: string } };
-    expect(detail.task.status).toBe("done");
+    const detail = (await approveRes.json()) as {
+      task: {
+        status: string;
+        human_review_reason: string | null;
+        pull_request: { number: number | null; url: string | null } | null;
+      };
+      artifacts: Array<{ kind: string; content: string | null }>;
+    };
+    expect(detail.task.status).toBe("human_review");
+    expect(detail.task.human_review_reason).toBe("approval");
+    expect(detail.task.pull_request?.number).toBe(7);
+    expect(detail.artifacts.some((artifact) => artifact.kind === "human_review_packet")).toBe(true);
   });
 
   it("returns a human_review task back to todo and resets the bounce counter", async () => {
@@ -438,6 +495,65 @@ describe("dashboard server — e2e", () => {
     expect(approveRes.status).toBe(200);
     const approved = (await approveRes.json()) as { status: string };
     expect(approved.status).toBe("approved");
+  });
+
+  it("forces a session fallback and records the handoff in task runs", async () => {
+    const conn = openDatabase(dbPath);
+    let sessionId = "";
+    let taskId = "";
+    try {
+      const worktreeMgr = new WorktreeManager({
+        repoRoot,
+        workspacesDir: path.join(repoRoot, ".deltapilot", "workspaces"),
+      });
+      const orch = new Orchestrator({ raw: conn.raw, db: conn.db, worktreeMgr, repoRoot });
+      const planner = await orch.registerAgent({
+        name: "managed-planner",
+        kind: "codex",
+        role: "planner",
+        runtimeMode: "managed",
+        transport: "mcp-stdio",
+      });
+      const task = await orch.createTask({ title: "fallback me" });
+      taskId = task.id;
+      const claimed = await orch.claimNextTask(planner.id);
+      expect(claimed?.status).toBe("planning");
+
+      sessionId = orch.createAgentSession({
+        agentId: planner.id,
+        taskId: task.id,
+        logPath: path.join(repoRoot, ".deltapilot", "fallback-session.log"),
+        status: "busy",
+      }).id;
+    } finally {
+      conn.close();
+    }
+
+    const fallbackRes = await fetch(`${server.origin}/api/sessions/${sessionId}/fallback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(fallbackRes.status).toBe(200);
+    const fallbackDetail = (await fallbackRes.json()) as {
+      session: { task_id: string | null; status: string; last_error: string | null };
+    };
+    expect(fallbackDetail.session.task_id).toBeNull();
+    expect(fallbackDetail.session.status).toBe("ready");
+    expect(fallbackDetail.session.last_error).toBe("Fallback requested by user");
+
+    const taskDetailRes = await fetch(`${server.origin}/api/tasks/${taskId}`);
+    expect(taskDetailRes.status).toBe(200);
+    const taskDetail = (await taskDetailRes.json()) as {
+      task: { status: string; assigned_agent_id: string | null };
+      attempts: Array<{ outcome: string | null; handoff_reason: string | null }>;
+    };
+    expect(taskDetail.task.status).toBe("planning");
+    expect(taskDetail.task.assigned_agent_id).toBeNull();
+    expect(taskDetail.attempts[0]).toMatchObject({
+      outcome: "handoff",
+      handoff_reason: "user",
+    });
   });
 
   it("launches and interrupts a managed terminal session from session controls", async () => {
