@@ -206,6 +206,90 @@ describe("Runner", () => {
     }
   }, 30_000);
 
+  it("marks human-review tasks done when their pull request was merged externally", async () => {
+    const { conn, orch } = makeOrchestrator(repoRoot, dbPath);
+    let taskId = "";
+    try {
+      const planner = await orch.registerAgent({
+        name: "planner",
+        kind: "mock",
+        role: "planner",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const executor = await orch.registerAgent({
+        name: "executor",
+        kind: "mock",
+        role: "executor",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+      const reviewer = await orch.registerAgent({
+        name: "reviewer",
+        kind: "mock",
+        role: "reviewer",
+        runtimeMode: "external",
+        transport: "mcp-stdio",
+      });
+
+      const task = await orch.createTask({ title: "Externally merged PR" });
+      taskId = task.id;
+      await orch.claimNextTask(planner.id);
+      await orch.publishPlan(task.id, planner.id, "Plan");
+      const execution = await orch.claimNextTask(executor.id);
+      await writeFile(path.join(execution!.worktree_path!, "merged.txt"), "done\n", "utf8");
+      await execFileAsync("git", ["add", "."], { cwd: execution!.worktree_path! });
+      await execFileAsync("git", ["commit", "-m", "exec"], { cwd: execution!.worktree_path! });
+      await orch.submitWork(task.id, executor.id);
+      const review = await orch.claimNextTask(reviewer.id);
+      await orch.approveForHumanReview(task.id, {
+        note: "Ready",
+        reason: "approval",
+        preserveWorktree: true,
+        pullRequest: {
+          provider: "github",
+          baseBranch: "main",
+          headBranch: review!.branch_name!,
+          headSha: "head-sha",
+          number: 77,
+          url: "https://github.com/example/repo/pull/77",
+          reviewDecision: "UNKNOWN",
+          mergedSha: null,
+          lastSyncedAt: new Date().toISOString(),
+          lastError: null,
+        },
+      }, reviewer.id);
+    } finally {
+      conn.close();
+    }
+
+    const githubHelper = createMockGitHubHelper();
+    vi.mocked(githubHelper.readPullRequest).mockResolvedValue({
+      provider: "github",
+      base_branch: "main",
+      head_branch: `deltapilot/task/${taskId}`,
+      head_sha: "head-sha",
+      number: 77,
+      url: "https://github.com/example/repo/pull/77",
+      review_decision: "UNKNOWN",
+      merged_sha: "external-merge-sha",
+      last_synced_at: new Date().toISOString(),
+      last_error: null,
+    });
+
+    const runner = new Runner({ repoRoot, dbPath, pollIntervalMs: 250, githubHelper });
+    try {
+      await runner.runOnce();
+      const finalTask = runner.orch.getTask(taskId);
+      expect(finalTask.status).toBe("done");
+      expect(finalTask.pull_request?.merged_sha).toBe("external-merge-sha");
+      expect(finalTask.worktree_path).toBeNull();
+      expect(existsSync(path.join(repoRoot, ".deltapilot", "workspaces", taskId))).toBe(false);
+    } finally {
+      await runner.stop();
+    }
+  });
+
   it("falls back to another managed agent after a rate limit", async () => {
     const { conn, orch } = makeOrchestrator(repoRoot, dbPath);
     let taskId = "";

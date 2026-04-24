@@ -54,6 +54,9 @@ interface GhPullRequestJson {
   headRefName?: string | null;
   headRefOid?: string | null;
   baseRefName?: string | null;
+  state?: string | null;
+  mergedAt?: string | null;
+  mergeCommit?: { oid?: string | null } | null;
 }
 
 export class GitHubCliHelper implements GitHubHelper {
@@ -96,7 +99,7 @@ export class GitHubCliHelper implements GitHubHelper {
     const baseBranch = input.baseBranch ?? "main";
     const { stdout } = await execa(
       "gh",
-      ["pr", "list", "--state", "open", "--head", input.branchName, "--base", baseBranch, "--json", "number,url,reviewDecision,headRefName,headRefOid,baseRefName"],
+      ["pr", "list", "--state", "all", "--head", input.branchName, "--base", baseBranch, "--json", "number,url,reviewDecision,headRefName,headRefOid,baseRefName,state,mergedAt,mergeCommit"],
       { cwd: input.repoRoot },
     );
     const items = JSON.parse(stdout) as GhPullRequestJson[];
@@ -110,7 +113,7 @@ export class GitHubCliHelper implements GitHubHelper {
       number: pr.number,
       url: pr.url ?? null,
       review_decision: normalizeReviewDecision(pr.reviewDecision),
-      merged_sha: null,
+      merged_sha: pr.state === "MERGED" ? pr.mergeCommit?.oid ?? null : null,
       last_synced_at: new Date().toISOString(),
       last_error: null,
     };

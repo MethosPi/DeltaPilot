@@ -606,6 +606,14 @@ export class Runner {
           continue;
         }
         this.orch.updateTaskPullRequest(task.id, toPullRequestUpdate(refreshed));
+        if (refreshed.merged_sha) {
+          await this.orch.recordExternalMerge(task.id, null, {
+            mergedSha: refreshed.merged_sha,
+            note: `Pull request #${refreshed.number ?? "?"} was already merged on GitHub.`,
+            pullRequest: toPullRequestUpdate(refreshed),
+          });
+          continue;
+        }
         if (refreshed.review_decision === "APPROVED") {
           this.orch.queueMerge(task.id);
         }

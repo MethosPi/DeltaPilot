@@ -1266,6 +1266,50 @@ export class Orchestrator {
     });
   }
 
+  async recordExternalMerge(
+    taskId: string,
+    actorAgentId: string | null,
+    input: {
+      mergedSha: string;
+      note?: string;
+      pullRequest?: TaskPullRequestUpdateInput;
+      preserveWorktree?: boolean;
+    },
+  ): Promise<Task> {
+    const task = this.getTask(taskId);
+    if (!["human_review", "merging"].includes(task.status)) {
+      throw new Error(`Task ${taskId} is not in human_review or merging`);
+    }
+    if (!input.mergedSha.trim()) {
+      throw new Error("mergedSha is required");
+    }
+
+    const pullRequest = normalizeTaskPullRequest(task.pull_request, {
+      ...input.pullRequest,
+      mergedSha: input.mergedSha,
+    });
+
+    this.finishTaskAttempt(task.id, actorAgentId, {
+      outcome: "completed",
+    });
+    return this.releaseTask(task, {
+      actorAgentId,
+      nextStatus: "done",
+      eventKind: "merge_result",
+      payload: {
+        result: "merged",
+        note: input.note ?? null,
+        merged_sha: input.mergedSha,
+        source: "external",
+      },
+      statusNote: null,
+      reviewBounceCount: task.review_bounce_count,
+      humanReviewReason: null,
+      pullRequest,
+      preserveWorktree: input.preserveWorktree ?? false,
+    });
+  }
+
   async returnToTodo(taskId: string, note?: string, actorAgentId: string | null = null): Promise<Task> {
     const task = this.getTask(taskId);
     if (!["human_review", "merging"].includes(task.status)) {
